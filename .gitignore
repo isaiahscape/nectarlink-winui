@@ -3,13 +3,13 @@
 **/*.rs.bk
 
 # .NET / WinUI 3 / Visual Studio / MSBuild
-[Bb]in/
-[Oo]bj/
-[Dd]ebug/
-[Rr]elease/
-[Aa][Rr][Mm]64/
-[Xx]64/
-[Xx]86/
+winui/**/[Bb]in/
+winui/**/[Oo]bj/
+winui/**/[Dd]ebug/
+winui/**/[Rr]elease/
+winui/**/[Aa][Rr][Mm]64/
+winui/**/[Xx]64/
+winui/**/[Xx]86/
 .vs/
 [Tt]est[Rr]esult*/
 [Aa]pp[Pp]ackages/
