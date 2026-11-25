@@ -1,0 +1,279 @@
+<Window
+    x:Class="NectarLink.WinUI.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="using:NectarLink.WinUI.Controls"
+    Title="NectarLink">
+
+    <Grid
+        x:Name="RootGrid"
+        AllowDrop="True"
+        Background="{ThemeResource NlSurfaceBrush}"
+        DragOver="OnRootDragOver"
+        DragLeave="OnRootDragLeave"
+        Drop="OnRootDrop">
+
+        <Grid.RowDefinitions>
+            <RowDefinition Height="48" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- Custom Title Bar matching Windows 11 Settings -->
+        <Grid
+            x:Name="TitleBarGrid"
+            Grid.Row="0"
+            Padding="16,0,8,0"
+            Background="Transparent">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="264" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition x:Name="TitleBarRightPaddingCol" Width="138" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                <Image Source="ms-appx:///Assets/brand/icon-512.png" Width="18" Height="18" />
+                <TextBlock
+                    Text="NectarLink"
+                    FontSize="12.5"
+                    FontWeight="SemiBold"
+                    Foreground="{ThemeResource NlOnSurfaceBrush}"
+                    VerticalAlignment="Center" />
+                <Border
+                    x:Name="OfflineBadge"
+                    Visibility="Collapsed"
+                    Background="{ThemeResource NlSecondaryContainerBrush}"
+                    CornerRadius="6"
+                    Padding="8,2,8,2"
+                    VerticalAlignment="Center">
+                    <TextBlock x:Name="OfflineBadgeText" FontSize="11" Foreground="{ThemeResource NlOnSecondaryContainerBrush}" />
+                </Border>
+            </StackPanel>
+
+            <!-- Windows Settings-style Search Pill aligned with content pane -->
+            <Button
+                x:Name="SearchPaletteBtn"
+                Grid.Column="1"
+                HorizontalAlignment="Left"
+                VerticalAlignment="Center"
+                Margin="14,0,12,0"
+                Width="380"
+                MaxWidth="420"
+                Height="32"
+                CornerRadius="16"
+                Padding="14,0,14,0"
+                HorizontalContentAlignment="Left"
+                Background="{ThemeResource NlSurfaceContainerBrush}"
+                BorderThickness="1"
+                BorderBrush="{ThemeResource NlCardStrokeBrush}"
+                Click="OnOpenCommandPaletteClick"
+                ToolTipService.ToolTip="Search commands, settings, contacts &amp; apps (Ctrl+Alt+Space)">
+                <Grid ColumnSpacing="10">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <FontIcon Glyph="&#xE721;" FontSize="13" Foreground="{ThemeResource NlOnSurfaceVariantBrush}" />
+                    <TextBlock
+                        Grid.Column="1"
+                        Text="Find a setting, contact, or command"
+                        FontSize="12.5"
+                        Foreground="{ThemeResource NlOnSurfaceVariantBrush}"
+                        VerticalAlignment="Center" />
+                </Grid>
+            </Button>
+
+            <!-- Notification pop-ups quick toggle -->
+            <StackPanel
+                Grid.Column="2"
+                Orientation="Horizontal"
+                Spacing="6"
+                VerticalAlignment="Center">
+                <ToggleButton
+                    x:Name="PausePopupsBtn"
+                    Height="32"
+                    Width="36"
+                    Padding="0"
+                    CornerRadius="6"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    Click="OnTogglePausePopups"
+                    ToolTipService.ToolTip="Pause notification pop-ups">
+                    <FontIcon Glyph="&#xEA8F;" FontSize="14" />
+                </ToggleButton>
+            </StackPanel>
+        </Grid>
+
+        <!-- Main Shell: Windows 11 Settings 280px Sidebar + Content Host -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="280" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Borderless Windows 11 Settings Navigation Pane -->
+            <Border
+                x:Name="NavRail"
+                Grid.Column="0"
+                Background="Transparent"
+                BorderThickness="0"
+                Padding="12,6,10,12">
+                <Grid RowSpacing="8">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+
+                    <!-- Active Phone "Profile" Card -->
+                    <Button
+                        x:Name="DeviceProfileBtn"
+                        HorizontalAlignment="Stretch"
+                        HorizontalContentAlignment="Stretch"
+                        Margin="0,0,0,6"
+                        Padding="8,8,10,8"
+                        CornerRadius="8"
+                        Background="Transparent"
+                        BorderThickness="0"
+                        Click="OnDeviceProfileClick">
+                        <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Border
+                                x:Name="DeviceProfileAvatarBorder"
+                                Width="52"
+                                Height="52"
+                                CornerRadius="26"
+                                Background="{ThemeResource NlPrimaryContainerBrush}">
+                                <FontIcon
+                                    x:Name="DeviceProfileAvatarIcon"
+                                    Glyph="&#xE8EA;"
+                                    FontSize="22"
+                                    Foreground="{ThemeResource NlOnPrimaryContainerBrush}" />
+                            </Border>
+                            <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="2">
+                                <TextBlock
+                                    x:Name="DeviceProfileTitle"
+                                    Text="No phone paired"
+                                    FontSize="14"
+                                    FontWeight="SemiBold"
+                                    Foreground="{ThemeResource NlOnSurfaceBrush}"
+                                    TextTrimming="CharacterEllipsis" />
+                                <TextBlock
+                                    x:Name="DeviceProfileSubtitle"
+                                    Text="Click to pair or switch"
+                                    FontSize="12"
+                                    Foreground="{ThemeResource NlOnSurfaceVariantBrush}"
+                                    TextTrimming="CharacterEllipsis" />
+                            </StackPanel>
+                            <FontIcon
+                                Grid.Column="2"
+                                Glyph="&#xE70D;"
+                                FontSize="11"
+                                Foreground="{ThemeResource NlOnSurfaceVariantBrush}" />
+                        </Grid>
+                    </Button>
+
+                    <ScrollViewer
+                        Grid.Row="1"
+                        HorizontalScrollMode="Disabled"
+                        HorizontalScrollBarVisibility="Disabled"
+                        VerticalScrollBarVisibility="Hidden">
+                        <StackPanel x:Name="RailTopItems" Spacing="3" />
+                    </ScrollViewer>
+
+                    <StackPanel x:Name="RailBottomItems" Grid.Row="2" Spacing="3" />
+                </Grid>
+            </Border>
+
+            <!-- Active Page + Context Banners + Overlays -->
+            <Grid Grid.Column="1" BorderThickness="0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <!-- Urgent action bars (Find PC ringing, Remote input ask, PC mirror ask, Continuity paste, Update ready) -->
+                <StackPanel x:Name="AlertBannerStack" Grid.Row="0" Spacing="6" Padding="22,10,22,0" Visibility="Collapsed" />
+
+                <!-- Page Viewport -->
+                <ContentPresenter x:Name="PageHost" Grid.Row="1" />
+            </Grid>
+        </Grid>
+
+        <!-- Global Drop Target Overlay -->
+        <Border
+            x:Name="DropOverlay"
+            Grid.RowSpan="2"
+            Visibility="Collapsed"
+            Background="{ThemeResource NlScrimBrush}"
+            Padding="32">
+            <Border
+                HorizontalAlignment="Center"
+                VerticalAlignment="Center"
+                Background="{ThemeResource NlFlyoutSurfaceBrush}"
+                BorderThickness="1"
+                BorderBrush="{ThemeResource NlCardStrokeBrush}"
+                CornerRadius="20"
+                Padding="36,28,36,28">
+                <StackPanel Spacing="10" HorizontalAlignment="Center">
+                    <FontIcon Glyph="&#xE898;" FontSize="38" Foreground="{ThemeResource NlPrimaryBrush}" />
+                    <TextBlock x:Name="DropOverlayText" FontSize="18" FontWeight="SemiBold" Foreground="{ThemeResource NlOnSurfaceBrush}" />
+                </StackPanel>
+            </Border>
+        </Border>
+
+        <!-- Command Palette Overlay -->
+        <Border
+            x:Name="PaletteScrim"
+            Grid.RowSpan="2"
+            Visibility="Collapsed"
+            Background="{ThemeResource NlScrimBrush}"
+            PointerPressed="OnPaletteScrimPressed">
+            <Border
+                Width="540"
+                MaxHeight="440"
+                VerticalAlignment="Top"
+                Margin="0,74,0,0"
+                HorizontalAlignment="Center"
+                Background="{ThemeResource NlFlyoutSurfaceBrush}"
+                BorderThickness="1"
+                BorderBrush="{ThemeResource NlCardStrokeBrush}"
+                CornerRadius="16"
+                Padding="14">
+                <StackPanel Spacing="10">
+                    <TextBox
+                        x:Name="PaletteSearchBox"
+                        PlaceholderText="Type a command, contact, phone app, or quick action…"
+                        TextChanged="OnPaletteQueryChanged"
+                        KeyDown="OnPaletteKeyDown" />
+                    <ScrollViewer MaxHeight="330">
+                        <StackPanel x:Name="PaletteResultsPanel" Spacing="4" />
+                    </ScrollViewer>
+                </StackPanel>
+            </Border>
+        </Border>
+
+        <!-- In-App Toast Banner -->
+        <Border
+            x:Name="ToastBanner"
+            Grid.Row="1"
+            Visibility="Collapsed"
+            HorizontalAlignment="Center"
+            VerticalAlignment="Bottom"
+            Margin="0,0,0,22"
+            Background="{ThemeResource NlFlyoutSurfaceBrush}"
+            BorderThickness="1"
+            BorderBrush="{ThemeResource NlCardStrokeBrush}"
+            CornerRadius="14"
+            Padding="14,10,14,10">
+            <StackPanel Orientation="Horizontal" Spacing="10">
+                <TextBlock x:Name="ToastMessage" VerticalAlignment="Center" Foreground="{ThemeResource NlOnSurfaceBrush}" />
+                <Button x:Name="ToastActionButton" Visibility="Collapsed" Click="OnToastActionClick" />
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>

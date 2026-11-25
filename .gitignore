@@ -1,0 +1,49 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# .NET / WinUI 3 / Visual Studio / MSBuild
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+[Aa][Rr][Mm]64/
+[Xx]64/
+[Xx]86/
+.vs/
+[Tt]est[Rr]esult*/
+[Aa]pp[Pp]ackages/
+[Bb]undle[Aa]rtifacts/
+publish/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+*.pdb
+*.cache
+*.nupkg
+*.snupkg
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+.dotnet/
+
+# Logs & temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+nul
+
+# OS & editors
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.vscode/
+!.vscode/extensions.json
+.idea/

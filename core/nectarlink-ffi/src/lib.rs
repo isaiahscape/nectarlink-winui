@@ -1,0 +1,6021 @@
+// SPDX-License-Identifier: MPL-2.0
+//! UniFFI bindings for `nectarlink-core`, used by the Android app.
+//!
+//! The boundary uses plain records and enums (see
+//! docs/architecture/core-api.md). The node runs on its own Tokio runtime;
+//! every async method executes there, so the foreign side can await it from
+//! any executor (Kotlin coroutines). Events are delivered to a foreign
+//! listener on a core thread; the listener should hand them off quickly.
+
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use nectarlink_core as core;
+use nectarlink_core::{
+    ConnectionPath, DeviceId, LinkState, Node, NodeConfig, NodeEvent, PairingEvent,
+    features::{CapabilityMatrix, FeatureState},
+};
+use tokio::{runtime::Runtime, sync::broadcast::error::RecvError};
+
+uniffi::setup_scaffolding!();
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+// ---- Records and enums ----
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum DeviceKind {
+    Phone,
+    Tablet,
+    Desktop,
+    Laptop,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct ScreenRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Eq for ScreenRect {}
+
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct ScreenCorners {
+    pub tl: f32,
+    pub tr: f32,
+    pub br: f32,
+    pub bl: f32,
+}
+
+impl Eq for ScreenCorners {}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ScreenShape {
+    #[uniffi(default = 1)]
+    pub v: u32,
+    pub aspect: f32,
+    #[uniffi(default = None)]
+    pub corners: Option<ScreenCorners>,
+    #[uniffi(default = [])]
+    pub cutouts: Vec<ScreenRect>,
+    #[uniffi(default = None)]
+    pub cutout_path: Option<String>,
+}
+
+impl Eq for ScreenShape {}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub kind: DeviceKind,
+    /// "android", "windows" or "macos".
+    pub os: String,
+    pub os_version: String,
+    pub model: Option<String>,
+    /// ARGB seed color for Material You sync.
+    pub accent: Option<u32>,
+    #[uniffi(default = None)]
+    pub screen: Option<ScreenShape>,
+    /// Identifies the device across reinstalls; see [`install_id_from`].
+    #[uniffi(default = None)]
+    pub install_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PowerLevel {
+    Basic,
+    Assist,
+    Elevated,
+    /// Desktops.
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Battery {
+    /// 0-100.
+    pub level: u8,
+    pub charging: bool,
+    /// "ac", "usb" or "wireless".
+    pub plugged: Option<String>,
+    /// Estimated minutes until full when charging, if known.
+    #[uniffi(default = None)]
+    pub full_in: Option<u16>,
+    /// Cellular signal bars (0-4), if known.
+    #[uniffi(default = None)]
+    pub cell_bars: Option<u8>,
+    /// Cellular network type ("5G", "LTE", "4G", "3G", "2G"), if known.
+    #[uniffi(default = None)]
+    pub cell_type: Option<String>,
+    /// Wi-Fi signal bars (0-4), if known.
+    #[uniffi(default = None)]
+    pub wifi_bars: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum Link {
+    /// `last_seen` is in Unix seconds.
+    Offline {
+        last_seen: Option<i64>,
+    },
+    Connecting,
+    Online {
+        relayed: bool,
+        #[uniffi(default = false)]
+        usb: bool,
+        rtt_ms: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PairedDevice {
+    /// The device ID (z-base-32).
+    pub id: String,
+    pub info: DeviceInfo,
+    /// Unix seconds.
+    pub paired_at: i64,
+    pub link: Link,
+    /// Whether this phone has stored Wake-on-LAN addresses for this PC.
+    pub can_wake: bool,
+    /// Whether this device reconnects to it by itself (`set_reconnect`).
+    pub reconnect: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DiscoveredDevice {
+    pub id: String,
+    pub name: Option<String>,
+}
+
+/// A LocalSend device discovered on the local network (`docs/protocol/v0.md`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LocalSendPeer {
+    pub id: String,
+    pub alias: String,
+    pub device_model: Option<String>,
+    pub device_type: String,
+    pub fingerprint: String,
+    pub ip: String,
+    pub port: u16,
+    pub protocol: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum PairingFailure {
+    Rejected,
+    Declined,
+    Expired,
+    Unreachable,
+    Other { message: String },
+}
+
+/// What unlocks a feature (see docs/architecture/capabilities.md).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Upgrade {
+    /// "raisePower", "grantPermission", "enableAddon", "enablePath",
+    /// "enableToggle" or "updateApp".
+    pub action: String,
+    /// E.g. "elevated", "notification_access", "clipboard", "phone".
+    pub target: String,
+    /// Roughly how long it takes; 0 for instant.
+    pub minutes: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FeatureStatus {
+    Available,
+    Partial {
+        limit: String,
+        upgrade: Option<Upgrade>,
+    },
+    Locked {
+        upgrade: Upgrade,
+    },
+    /// `reason`: "deviceKinds", "android:<release>", "windows:<build>" or
+    /// "notOnThisDevice".
+    Unsupported {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Feature {
+    pub id: String,
+    pub status: FeatureStatus,
+}
+
+/// A button on a notification.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct NotificationAction {
+    pub id: String,
+    pub title: String,
+    /// Takes text (an inline reply).
+    pub reply: bool,
+}
+
+/// One segment in an Android 16 `Notification.ProgressStyle` progress bar.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LiveSegment {
+    pub length: u32,
+    #[uniffi(default = None)]
+    pub color: Option<u32>,
+}
+
+/// One milestone point on an Android 16 `Notification.ProgressStyle` progress bar.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LivePoint {
+    pub position: u32,
+    #[uniffi(default = None)]
+    pub color: Option<u32>,
+}
+
+/// Live Update and ongoing progress/timer metadata attached to a [`Notification`].
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct NotificationLive {
+    #[uniffi(default = 1)]
+    pub v: u32,
+    #[uniffi(default = None)]
+    pub progress: Option<u32>,
+    #[uniffi(default = None)]
+    pub max: Option<u32>,
+    #[uniffi(default = false)]
+    pub indeterminate: bool,
+    #[uniffi(default = None)]
+    pub chip: Option<String>,
+    #[uniffi(default = [])]
+    pub segments: Vec<LiveSegment>,
+    #[uniffi(default = [])]
+    pub points: Vec<LivePoint>,
+    #[uniffi(default = false)]
+    pub chronometer: bool,
+    #[uniffi(default = false)]
+    pub countdown: bool,
+}
+
+impl std::fmt::Debug for NotificationLive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotificationLive")
+            .field("v", &self.v)
+            .field("progress", &self.progress)
+            .field("max", &self.max)
+            .field("indeterminate", &self.indeterminate)
+            .field("chronometer", &self.chronometer)
+            .field("countdown", &self.countdown)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Ongoing or completed task notification sent by a paired PC (`task.notify`).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TaskNotify {
+    pub id: String,
+    pub title: String,
+    pub active: bool,
+    pub elapsed_ms: u64,
+    #[uniffi(default = None)]
+    pub exit_code: Option<i32>,
+}
+
+impl std::fmt::Debug for TaskNotify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskNotify")
+            .field("id", &self.id)
+            .field("active", &self.active)
+            .field("elapsed_ms", &self.elapsed_ms)
+            .field("exit_code", &self.exit_code)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One chat message inside a `MessagingStyle` notification conversation.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct NotificationChatMessage {
+    /// Sender display name (`None` for the user's own messages or 1:1 chats
+    /// where the conversation title is the sender).
+    #[uniffi(default = None)]
+    pub sender: Option<String>,
+    pub text: String,
+    /// Unix milliseconds.
+    pub time: i64,
+    /// True when sent by the phone user.
+    #[uniffi(default = false)]
+    pub self_sent: bool,
+    /// Optional sender avatar (JPEG/PNG, at most 16 KiB).
+    #[uniffi(default = None)]
+    pub avatar: Option<Vec<u8>>,
+}
+
+/// Never prints message text or sender names (protocol v0 §11).
+impl std::fmt::Debug for NotificationChatMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotificationChatMessage")
+            .field("time", &self.time)
+            .field("self_sent", &self.self_sent)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Structured `MessagingStyle` conversation metadata carried on a notification.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct NotificationConversation {
+    /// Schema version (`1`).
+    #[uniffi(default = 1)]
+    pub v: u32,
+    /// Conversation or sender display title.
+    pub title: String,
+    /// True for group conversations (`MessagingStyle.isGroupConversation`).
+    #[uniffi(default = false)]
+    pub group: bool,
+    /// Optional conversation/sender avatar (JPEG/PNG, at most 16 KiB).
+    #[uniffi(default = None)]
+    pub avatar: Option<Vec<u8>>,
+    /// Chronological messages in the notification (oldest first).
+    pub messages: Vec<NotificationChatMessage>,
+}
+
+/// Never prints conversation title or messages (protocol v0 §11).
+impl std::fmt::Debug for NotificationConversation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotificationConversation")
+            .field("v", &self.v)
+            .field("group", &self.group)
+            .field("messages_len", &self.messages.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A notification, as mirrored between devices
+/// (docs/protocol/notifications.md).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Notification {
+    /// This device's ID for it (Android: the StatusBarNotification key).
+    pub key: String,
+    /// Package name.
+    pub app: String,
+    pub app_name: String,
+    pub title: Option<String>,
+    pub text: Option<String>,
+    pub sub: Option<String>,
+    /// Unix milliseconds.
+    pub when: i64,
+    pub actions: Vec<NotificationAction>,
+    /// Arrived without sound or pop-up.
+    pub silent: bool,
+    /// The app icon as PNG; pass it every time, the core sends it once per
+    /// device and connection.
+    pub icon: Option<Vec<u8>>,
+    /// A picture it shows (a photo in a message, a big picture): JPEG, at
+    /// most 160 KiB.
+    pub image: Option<Vec<u8>>,
+    /// Live Update / ongoing progress or timer metadata, when present.
+    #[uniffi(default = None)]
+    pub live: Option<NotificationLive>,
+    /// Structured `MessagingStyle` conversation metadata, when present.
+    #[uniffi(default = None)]
+    pub conversation: Option<NotificationConversation>,
+    /// Can't be dismissed (ongoing or no-clear), so a PC's Clear all leaves
+    /// it. Last, with a default, so positional callers keep working.
+    #[uniffi(default = false)]
+    pub ongoing: bool,
+}
+
+/// Something playing (or paused) on a device (docs/protocol/media.md).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MediaPlayer {
+    /// Stable while the player exists (Android: the app's package name).
+    pub id: String,
+    /// User-visible app name.
+    pub app: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub playing: bool,
+    /// Milliseconds.
+    pub duration: Option<u64>,
+    /// Milliseconds, now; it moves on in real time while `playing`.
+    pub position: Option<u64>,
+    pub actions: Vec<MediaAction>,
+    /// Identifies the artwork: the same key, the same picture.
+    pub art_key: Option<String>,
+    /// JPEG or PNG. Pass it every time; the core sends it once per device
+    /// and connection. Arrives the same way: keep it by `art_key`.
+    pub art: Option<Vec<u8>>,
+}
+
+/// Never prints what's playing (protocol v0 §11).
+impl std::fmt::Debug for MediaPlayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaPlayer").field("id", &self.id).finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MediaAction {
+    Play,
+    Pause,
+    Next,
+    Previous,
+    Seek,
+}
+
+impl From<MediaAction> for core::MediaAction {
+    fn from(a: MediaAction) -> Self {
+        match a {
+            MediaAction::Play => core::MediaAction::Play,
+            MediaAction::Pause => core::MediaAction::Pause,
+            MediaAction::Next => core::MediaAction::Next,
+            MediaAction::Previous => core::MediaAction::Previous,
+            MediaAction::Seek => core::MediaAction::Seek,
+        }
+    }
+}
+
+impl From<core::MediaAction> for MediaAction {
+    fn from(a: core::MediaAction) -> Self {
+        match a {
+            core::MediaAction::Play => MediaAction::Play,
+            core::MediaAction::Pause => MediaAction::Pause,
+            core::MediaAction::Next => MediaAction::Next,
+            core::MediaAction::Previous => MediaAction::Previous,
+            core::MediaAction::Seek => MediaAction::Seek,
+        }
+    }
+}
+
+impl From<MediaPlayer> for core::MediaPlayer {
+    fn from(p: MediaPlayer) -> Self {
+        core::MediaPlayer {
+            id: p.id,
+            app: p.app,
+            title: p.title,
+            artist: p.artist,
+            album: p.album,
+            playing: p.playing,
+            duration: p.duration,
+            position: p.position,
+            actions: p.actions.into_iter().map(|a| core::MediaAction::from(a).as_str().to_owned()).collect(),
+            art_key: p.art_key,
+            art: p.art,
+        }
+    }
+}
+
+impl From<core::MediaPlayer> for MediaPlayer {
+    fn from(p: core::MediaPlayer) -> Self {
+        MediaPlayer {
+            id: p.id,
+            app: p.app,
+            title: p.title,
+            artist: p.artist,
+            album: p.album,
+            playing: p.playing,
+            duration: p.duration,
+            position: p.position,
+            actions: p.actions.iter().filter_map(|a| core::MediaAction::parse(a)).map(Into::into).collect(),
+            art_key: p.art_key,
+            art: p.art,
+        }
+    }
+}
+
+/// Never prints content (protocol v0 §11).
+impl std::fmt::Debug for Notification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Notification").field("app", &self.app).finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TransferDirection {
+    Outgoing,
+    Incoming,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum TransferStatus {
+    /// Incoming transfer waiting for the user to accept or decline (LocalSend).
+    Requested,
+    /// Waiting for the other device (to connect, or to continue).
+    Waiting,
+    Running,
+    /// Manually paused by either side; partial files are kept on the receiver.
+    Paused,
+    /// `saved`: where received files are, one path per item in `names`:
+    /// each file, and each sent folder (empty when
+    /// sending).
+    Done {
+        saved: Vec<String>,
+    },
+    /// `reason`: "denied", "unreachable", "noSpace", "interrupted", "integrity"
+    /// or "other".
+    Failed {
+        reason: String,
+    },
+    Cancelled,
+}
+
+/// A timestamped marker within a voice recording (docs/protocol/recorder.md).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RecordingMarker {
+    pub at_ms: u64,
+    pub label: Option<String>,
+}
+
+/// A file transfer (docs/protocol/files.md).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Transfer {
+    pub id: String,
+    /// The other device.
+    pub device_id: String,
+    pub direction: TransferDirection,
+    /// What was sent: file and folder names, in order.
+    pub names: Vec<String>,
+    /// How many files that is (folders' files included).
+    pub files: u32,
+    pub total: u64,
+    pub done: u64,
+    pub status: TransferStatus,
+    /// True when this transfer is a voice recording from the phone's recorder.
+    pub recording: bool,
+    /// Markers captured during the recording.
+    pub markers: Vec<RecordingMarker>,
+    /// True when the sender handed off a single document that should open with
+    /// the default app once it arrives (`docs/protocol/files.md`).
+    pub open_on_arrival: bool,
+}
+
+/// Never prints file names (protocol v0 §11).
+impl std::fmt::Debug for Transfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Transfer").field("id", &self.id).field("status", &self.status).finish_non_exhaustive()
+    }
+}
+
+/// A file to send.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FileToSend {
+    /// An open, readable descriptor (Android: from a content URI). The core
+    /// takes ownership and closes it.
+    Fd {
+        name: String,
+        fd: i32,
+        /// The folder it's in, when sending a folder: `/`-separated names,
+        /// starting with the folder's own (`Trip/Day 1`).
+        folder: Option<String>,
+    },
+    Path {
+        name: String,
+        path: String,
+        folder: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DeviceToggle {
+    pub name: String,
+    pub enabled: bool,
+}
+
+/// Everything the UI needs to know about, as it happens.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum Event {
+    DeviceAdded {
+        device: PairedDevice,
+    },
+    DeviceRemoved {
+        id: String,
+    },
+    LinkChanged {
+        id: String,
+        link: Link,
+    },
+    PeerInfoChanged {
+        id: String,
+        info: DeviceInfo,
+    },
+    PeerPowerChanged {
+        id: String,
+        power: PowerLevel,
+    },
+    Battery {
+        id: String,
+        battery: Battery,
+    },
+    /// A device heard of a new NectarLink build on `channel` ("stable" or
+    /// "nightly"): check that channel's feed now.
+    UpdateHint {
+        id: String,
+        channel: String,
+        version: String,
+    },
+    /// A device asked this one to start (or stop) ringing.
+    Ring {
+        id: String,
+        on: bool,
+    },
+    RemoteRing {
+        id: String,
+        on: bool,
+    },
+    Discovered {
+        device: DiscoveredDevice,
+    },
+    DiscoveryExpired {
+        id: String,
+    },
+    /// Show this 6-digit code and ask the user whether it matches.
+    PairingCode {
+        peer: String,
+        code: String,
+    },
+    Paired {
+        device: PairedDevice,
+    },
+    PairingFailed {
+        failure: PairingFailure,
+    },
+    Capabilities {
+        id: String,
+        features: Vec<Feature>,
+    },
+    NotificationsReset {
+        id: String,
+        items: Vec<Notification>,
+    },
+    NotificationPosted {
+        id: String,
+        notification: Notification,
+    },
+    NotificationRemoved {
+        id: String,
+        key: String,
+    },
+    /// A device put text on this phone's clipboard.
+    ClipboardReceived {
+        id: String,
+    },
+    /// The local clipboard history changed.
+    ClipboardHistoryChanged,
+    /// A file transfer started, progressed or finished.
+    Transfer {
+        transfer: Transfer,
+    },
+    /// A device's media players (all of them; empty when nothing plays
+    /// there, or media is off for it).
+    MediaChanged {
+        id: String,
+        players: Vec<MediaPlayer>,
+    },
+    /// A paired phone took a photo (PCs only; phones announce theirs).
+    PhotoAdded {
+        id: String,
+        photo_id: String,
+    },
+    /// A call on a paired phone changed (PCs only; phones report theirs).
+    CallChanged {
+        id: String,
+        call_id: String,
+    },
+    /// A paired phone's call history changed (PCs only).
+    CallLogChanged {
+        id: String,
+    },
+    /// A paired phone's contacts changed (PCs only).
+    ContactsChanged {
+        id: String,
+    },
+    /// A paired device making a problem report asks for this phone's recent
+    /// activity log: ask the user, then `report_log_answer`.
+    DiagLogAsked {
+        id: String,
+    },
+    /// The log asked for with `report_ask` arrived (`shared`) or was
+    /// declined; `report_prepare` now includes it.
+    ReportLogArrived {
+        id: String,
+        shared: bool,
+    },
+    /// A paired phone's screen (session 0) or app window started or
+    /// stopped showing (PCs only).
+    Mirroring {
+        id: String,
+        session: u32,
+        on: bool,
+    },
+    /// A paired phone's messages changed (PCs only).
+    SmsChanged {
+        id: String,
+        thread: Option<String>,
+    },
+    /// A paired phone's photo library changed (PCs only).
+    PhotosChanged {
+        id: String,
+    },
+    /// A paired phone asked to control this PC while `remote_input` is off
+    /// (PCs only).
+    RemoteInputRequested {
+        id: String,
+    },
+    /// A paired phone's quick settings state (PCs only).
+    PhoneToggles {
+        id: String,
+        toggles: PhoneToggles,
+    },
+    /// A paired PC's stored Wake-on-LAN addresses changed (phones only).
+    WakeInfoChanged {
+        id: String,
+        can_wake: bool,
+    },
+    /// Reconnecting to a paired device by itself was turned off or back on
+    /// (`set_reconnect`).
+    ReconnectChanged {
+        id: String,
+        on: bool,
+    },
+    /// A paired PC's Deck layout arrived or changed (phones only).
+    DeckLayout {
+        id: String,
+        layout: DeckLayout,
+    },
+    /// A paired PC's live Deck state arrived or changed (phones only).
+    DeckState {
+        id: String,
+        state: DeckState,
+    },
+    /// A paired phone's camera started or stopped streaming as a webcam
+    /// (PCs only).
+    Webcam {
+        id: String,
+        on: bool,
+    },
+    /// A paired PC asked to browse this phone's storage while `storage` is off
+    /// (phones only).
+    StorageRequested {
+        id: String,
+    },
+    /// A folder on a paired phone changed (PCs only).
+    StorageChanged {
+        id: String,
+        path: String,
+    },
+    /// The local cross-device timeline changed.
+    TimelineChanged,
+    /// The LocalSend compatibility setting or discovered LocalSend peers changed.
+    LocalSendChanged,
+    /// A PCM audio frame arrived from a paired PC (`audio.pcm`).
+    PcAudioFrame {
+        device: String,
+        sample_rate: u32,
+        channels: u8,
+        pcm: Vec<u8>,
+    },
+    /// A paired PC's microphone for the call in progress (`call.audio`):
+    /// 16 kHz mono 16-bit PCM to put into the call.
+    CallAudioUplink {
+        device: String,
+        pcm: Vec<u8>,
+    },
+    /// A paired PC started streaming its screen to this phone (`mirror` video stream config).
+    PcMirrorConfig {
+        id: String,
+        codec: String,
+        width: u32,
+        height: u32,
+    },
+    /// An encoded video frame arrived from a paired PC's screen stream.
+    PcMirrorFrame {
+        id: String,
+        keyframe: bool,
+        time_us: u64,
+        data: Vec<u8>,
+    },
+    /// A paired PC's screen stream ended.
+    PcMirrorEnded {
+        id: String,
+    },
+    /// The PC couldn't start or continue sharing its screen.
+    PcMirrorCaptureFailed {
+        id: String,
+    },
+    /// The persistent outgoing send queue changed.
+    QueueChanged,
+    /// Pending outgoing queue items were dropped because the peer was unpaired.
+    QueueDroppedOnUnpair {
+        device_id: String,
+        device_name: String,
+        dropped_count: u32,
+    },
+}
+
+/// Play on phone: a video file a PC offers for the phone to play itself
+/// (`docs/protocol/media.md` §4), read with `watch_file_read`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct WatchFileOffer {
+    /// Its file name, for the player to tell the format by.
+    pub name: String,
+    pub size: u64,
+    /// Where the PC had got to, milliseconds.
+    pub position_ms: u64,
+}
+
+/// Bytes of an offered file (`watch_file_read`), and the file's size.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct WatchFileChunk {
+    pub size: u64,
+    pub data: Vec<u8>,
+}
+
+/// One file or folder returned by `list_remote_storage` (`storage.list`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RemoteStorageEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub size: u64,
+    pub modified: i64,
+}
+
+/// One tile on a PC's Deck (`docs/protocol/deck.md`).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DeckTile {
+    pub id: String,
+    pub label: String,
+    pub icon: String,
+    pub color: String,
+    pub kind: String,
+}
+
+impl std::fmt::Debug for DeckTile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeckTile")
+            .field("id", &self.id)
+            .field("icon", &self.icon)
+            .field("color", &self.color)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<core::DeckTile> for DeckTile {
+    fn from(t: core::DeckTile) -> Self {
+        DeckTile { id: t.id, label: t.label, icon: t.icon, color: t.color, kind: t.kind }
+    }
+}
+
+/// One page of tiles on a PC's Deck (`docs/protocol/deck.md`).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DeckPage {
+    pub id: String,
+    pub name: String,
+    pub tiles: Vec<DeckTile>,
+}
+
+impl std::fmt::Debug for DeckPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeckPage")
+            .field("id", &self.id)
+            .field("tiles", &self.tiles.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<core::DeckPage> for DeckPage {
+    fn from(p: core::DeckPage) -> Self {
+        DeckPage { id: p.id, name: p.name, tiles: p.tiles.into_iter().map(Into::into).collect() }
+    }
+}
+
+/// A PC's Deck layout (`docs/protocol/deck.md`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DeckLayout {
+    pub pages: Vec<DeckPage>,
+}
+
+impl From<core::DeckLayout> for DeckLayout {
+    fn from(l: core::DeckLayout) -> Self {
+        DeckLayout { pages: l.pages.into_iter().map(Into::into).collect() }
+    }
+}
+
+/// An active audio output device on a paired PC (`docs/protocol/deck.md`).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AudioOutputDevice {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+impl std::fmt::Debug for AudioOutputDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioOutputDevice").field("is_default", &self.is_default).finish_non_exhaustive()
+    }
+}
+
+impl From<core::AudioOutputDevice> for AudioOutputDevice {
+    fn from(d: core::AudioOutputDevice) -> Self {
+        AudioOutputDevice { id: d.id, name: d.name, is_default: d.is_default }
+    }
+}
+
+/// Live PC state reflected on Deck tiles (`docs/protocol/deck.md`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DeckState {
+    pub playing: bool,
+    pub volume: u8,
+    pub muted: bool,
+    pub mic_muted: Option<bool>,
+    pub output_devices: Vec<AudioOutputDevice>,
+}
+
+impl From<core::DeckState> for DeckState {
+    fn from(s: core::DeckState) -> Self {
+        DeckState {
+            playing: s.playing,
+            volume: s.volume,
+            muted: s.muted,
+            mic_muted: s.mic_muted,
+            output_devices: s.output_devices.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// The recognized kind of a text clip (`docs/protocol/clipboard.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ClipKind {
+    WebLink,
+    StreetAddress,
+    PhoneNumber,
+    TrackingNumber,
+    Email,
+}
+
+impl From<core::ClipKind> for ClipKind {
+    fn from(k: core::ClipKind) -> Self {
+        match k {
+            core::ClipKind::WebLink => ClipKind::WebLink,
+            core::ClipKind::StreetAddress => ClipKind::StreetAddress,
+            core::ClipKind::PhoneNumber => ClipKind::PhoneNumber,
+            core::ClipKind::TrackingNumber => ClipKind::TrackingNumber,
+            core::ClipKind::Email => ClipKind::Email,
+        }
+    }
+}
+
+/// A context chip suggestion for a received text clip.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ClipSuggestion {
+    pub kind: ClipKind,
+    pub action_label: String,
+    pub target: String,
+}
+
+/// Never prints the target text (protocol v0 §11).
+impl std::fmt::Debug for ClipSuggestion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClipSuggestion").field("kind", &self.kind).finish_non_exhaustive()
+    }
+}
+
+impl From<core::ClipSuggestion> for ClipSuggestion {
+    fn from(s: core::ClipSuggestion) -> Self {
+        ClipSuggestion { kind: s.kind.into(), action_label: s.action_label().into(), target: s.target }
+    }
+}
+
+/// This phone's quick settings state (docs/protocol/toggles.md).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PhoneToggles {
+    pub dnd: bool,
+    /// `"ring"`, `"vibrate"` or `"silent"`.
+    pub ringer: String,
+    /// `None` when the phone has no camera flash.
+    pub flashlight: Option<bool>,
+    /// Media volume, `0..=100`.
+    pub volume: u8,
+    /// Screen brightness, `0..=100`.
+    pub brightness: u8,
+    pub wifi: bool,
+    pub bluetooth: bool,
+}
+
+impl From<core::PhoneToggles> for PhoneToggles {
+    fn from(t: core::PhoneToggles) -> Self {
+        PhoneToggles {
+            dnd: t.dnd,
+            ringer: t.ringer,
+            flashlight: t.flashlight,
+            volume: t.volume,
+            brightness: t.brightness,
+            wifi: t.wifi,
+            bluetooth: t.bluetooth,
+        }
+    }
+}
+
+impl From<PhoneToggles> for core::PhoneToggles {
+    fn from(t: PhoneToggles) -> Self {
+        core::PhoneToggles {
+            dnd: t.dnd,
+            ringer: t.ringer,
+            flashlight: t.flashlight,
+            volume: t.volume,
+            brightness: t.brightness,
+            wifi: t.wifi,
+            bluetooth: t.bluetooth,
+        }
+    }
+}
+
+/// The value to set for a phone quick setting (`phone.toggle.set`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum PhoneToggleValue {
+    Bool { on: bool },
+    Level { level: u8 },
+    Mode { mode: String },
+}
+
+/// What a mirroring video packet holds (docs/protocol/mirror.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum VideoPacketKind {
+    /// The stream's format, from `mirror_config`.
+    Config,
+    Frame,
+    Keyframe,
+}
+
+/// The PC's mouse, keyboard, or gamepad on the mirrored screen. Positions are
+/// fractions of the screen (0 to 1).
+#[derive(Clone, PartialEq, uniffi::Enum)]
+pub enum MirrorInputEvent {
+    Touch {
+        action: TouchPhase,
+        x: f32,
+        y: f32,
+    },
+    /// The mouse wheel, in notches (positive: down / right).
+    Scroll {
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+    },
+    /// "back", "home", "recents", "enter", "backspace", "delete", "left",
+    /// "right", "up", "down", "tab" or "notifications".
+    Key {
+        key: String,
+    },
+    Text {
+        text: String,
+    },
+    /// Gamepad controller state (XInput-style buttons bitmask, stick axes, and triggers).
+    Gamepad {
+        buttons: u16,
+        lx: i16,
+        ly: i16,
+        rx: i16,
+        ry: i16,
+        lt: u8,
+        rt: u8,
+    },
+}
+
+pub type MirrorInput = MirrorInputEvent;
+
+/// Never prints typed text (protocol v0 §11).
+impl std::fmt::Debug for MirrorInputEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MirrorInputEvent::Text { text } => write!(f, "Text({} bytes)", text.len()),
+            MirrorInputEvent::Touch { action, .. } => write!(f, "Touch({action:?})"),
+            MirrorInputEvent::Scroll { .. } => f.write_str("Scroll"),
+            MirrorInputEvent::Key { key } => write!(f, "Key({key})"),
+            MirrorInputEvent::Gamepad { buttons, .. } => write!(f, "Gamepad({buttons:#06x})"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TouchPhase {
+    Down,
+    Move,
+    Up,
+}
+
+impl From<core::MirrorInput> for MirrorInputEvent {
+    fn from(input: core::MirrorInput) -> Self {
+        match input {
+            core::MirrorInput::Touch { action, x, y } => MirrorInputEvent::Touch {
+                action: match action {
+                    core::TouchAction::Down => TouchPhase::Down,
+                    core::TouchAction::Move => TouchPhase::Move,
+                    core::TouchAction::Up => TouchPhase::Up,
+                },
+                x,
+                y,
+            },
+            core::MirrorInput::Scroll { x, y, dx, dy } => MirrorInputEvent::Scroll { x, y, dx, dy },
+            core::MirrorInput::Key { key } => MirrorInputEvent::Key { key },
+            core::MirrorInput::Text { text } => MirrorInputEvent::Text { text },
+            core::MirrorInput::Gamepad { buttons, lx, ly, rx, ry, lt, rt } => {
+                MirrorInputEvent::Gamepad { buttons, lx, ly, rx, ry, lt, rt }
+            }
+        }
+    }
+}
+
+impl From<MirrorInputEvent> for core::MirrorInput {
+    fn from(input: MirrorInputEvent) -> Self {
+        match input {
+            MirrorInputEvent::Touch { action, x, y } => core::MirrorInput::Touch {
+                action: match action {
+                    TouchPhase::Down => core::TouchAction::Down,
+                    TouchPhase::Move => core::TouchAction::Move,
+                    TouchPhase::Up => core::TouchAction::Up,
+                },
+                x,
+                y,
+            },
+            MirrorInputEvent::Scroll { x, y, dx, dy } => core::MirrorInput::Scroll { x, y, dx, dy },
+            MirrorInputEvent::Key { key } => core::MirrorInput::Key { key },
+            MirrorInputEvent::Text { text } => core::MirrorInput::Text { text },
+            MirrorInputEvent::Gamepad { buttons, lx, ly, rx, ry, lt, rt } => {
+                core::MirrorInput::Gamepad { buttons, lx, ly, rx, ry, lt, rt }
+            }
+        }
+    }
+}
+
+/// What became of a video (or sound) packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MirrorSendResult {
+    Queued,
+    /// Sound dropped: the network is behind (the next packet may go).
+    Dropped,
+    /// The network is behind: request a keyframe from the encoder (frames
+    /// are dropped until one comes).
+    NeedKeyframe,
+    /// The PC stopped watching: stop sharing the screen.
+    Closed,
+}
+
+/// This phone's screen (or its sound) going to one PC.
+#[derive(Debug, uniffi::Object)]
+pub struct MirrorStream(core::MirrorStream);
+
+#[uniffi::export]
+impl MirrorStream {
+    /// Hands over a packet without waiting (a config packet waits for room).
+    pub fn send(&self, kind: VideoPacketKind, time_us: u64, data: Vec<u8>) -> MirrorSendResult {
+        let kind = match kind {
+            VideoPacketKind::Config => core::PacketKind::Config,
+            VideoPacketKind::Frame => core::PacketKind::Frame,
+            VideoPacketKind::Keyframe => core::PacketKind::Keyframe,
+        };
+        match self.0.send(kind, time_us, data) {
+            core::MirrorSend::Queued => MirrorSendResult::Queued,
+            core::MirrorSend::Dropped => MirrorSendResult::Dropped,
+            core::MirrorSend::NeedKeyframe => MirrorSendResult::NeedKeyframe,
+            core::MirrorSend::Closed => MirrorSendResult::Closed,
+        }
+    }
+
+    /// Ends the stream (`close` frees the object, as for every object).
+    pub fn end(&self) {
+        self.0.close();
+    }
+}
+
+/// The bytes of a config packet for an H.264 stream of this size, for the
+/// screen (session 0) or an app window.
+#[uniffi::export]
+pub fn mirror_config(width: u32, height: u32, session: u32) -> Vec<u8> {
+    core::MirrorConfig { codec: "h264".into(), width, height, session }.to_cbor()
+}
+
+/// The bytes of a config packet for a stream of `codec` (`"h264"`, `"h265"`, or `"av1"`).
+#[uniffi::export]
+pub fn mirror_config_codec(codec: String, width: u32, height: u32, session: u32) -> Vec<u8> {
+    core::MirrorConfig { codec, width, height, session }.to_cbor()
+}
+
+/// What a PC asked to mirror, and how (docs/protocol/mirror.md).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MirrorOptions {
+    /// The longer side, in pixels, at most.
+    pub max_size: u32,
+    pub fps: u32,
+    pub bitrate: u32,
+    /// The sound too (the screen only).
+    pub audio: bool,
+    /// 0 for the screen; another for an app window.
+    pub session: u32,
+    /// The app (package name) to show in a window of its own.
+    pub app: Option<String>,
+    /// Keep the phone awake while mirroring (`session == 0`).
+    pub stay_awake: bool,
+    /// Turn the phone's physical screen off while mirroring (`session == 0`, Elevated).
+    pub screen_off: bool,
+    /// Only the sound, no picture: the PC plays it without a window.
+    pub sound_only: bool,
+}
+
+/// The phone's screen as the pointer the PC's mouse moves sees it, and how
+/// far one count moves it (the answer to `pointer_enter`).
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct PointerScreen {
+    pub width: u32,
+    pub height: u32,
+    /// Pixels per count.
+    pub scale: f32,
+}
+
+/// Where the pointer the PC's mouse moves is, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct PointerPosition {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// An app a PC can open in a window (docs/protocol/mirror.md).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PhoneApp {
+    /// Package name.
+    pub pkg: String,
+    pub label: String,
+    /// A small PNG icon (at most 8 KiB).
+    pub icon: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for PhoneApp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhoneApp").field("pkg", &self.pkg).finish_non_exhaustive()
+    }
+}
+
+/// The bytes of a config packet for 16-bit PCM sound.
+#[uniffi::export]
+pub fn mirror_audio_config(rate: u32, channels: u8) -> Vec<u8> {
+    core::MirrorAudioConfig { codec: core::MIRROR_PCM.into(), rate, channels }.to_cbor()
+}
+
+/// The bytes of a config packet for an H.264 webcam stream
+/// (`docs/protocol/webcam.md`); `max_height` is 2160 when the camera in use
+/// can stream 4K, else 1080.
+#[uniffi::export]
+pub fn webcam_config(width: u32, height: u32, camera: String, fps: u32, max_height: u32) -> Vec<u8> {
+    core::WebcamConfig { codec: core::WEBCAM_H264.into(), width, height, camera, fps, max_height }.to_cbor()
+}
+
+/// A webcam config for a negotiated codec; retain webcam_config for older callers.
+#[uniffi::export]
+pub fn webcam_config_codec(
+    codec: String,
+    width: u32,
+    height: u32,
+    camera: String,
+    fps: u32,
+    max_height: u32,
+) -> Vec<u8> {
+    core::WebcamConfig { codec, width, height, camera, fps, max_height }.to_cbor()
+}
+
+/// What a PC asked the phone's camera to stream (`docs/protocol/webcam.md`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct WebcamOptions {
+    /// `"back"` or `"front"`.
+    pub camera: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate: u32,
+}
+
+/// A conversation (docs/protocol/sms.md).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SmsThread {
+    pub id: String,
+    /// The other people's numbers (more than one: a group).
+    pub addresses: Vec<String>,
+    /// Their contact names, in the same order ("" when not a contact).
+    pub names: Vec<String>,
+    /// The latest message's text, or a description like "Photo".
+    pub snippet: String,
+    /// Unix milliseconds.
+    pub date: i64,
+    pub unread: u32,
+    /// The contact's photo (one-person conversations): a JPEG of at most 16 KB.
+    pub photo: Option<Vec<u8>>,
+}
+
+/// A message in a conversation.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SmsMessage {
+    pub id: String,
+    pub thread: String,
+    /// Who sent it (received), or the recipient (sent).
+    pub address: String,
+    pub body: String,
+    /// Unix milliseconds.
+    pub date: i64,
+    pub outgoing: bool,
+    /// Sent messages: "sent", "pending" or "failed".
+    pub status: Option<String>,
+    /// Pictures and other attachments, fetched with `sms_part`.
+    pub parts: Vec<SmsPart>,
+    /// The SIM it came in on or went out from (an id from `sms_sims`), when known.
+    pub sim: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SmsPart {
+    pub id: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+/// An attachment's bytes.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SmsPartData {
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+/// An outgoing MMS image attachment (`image/jpeg` or `image/png`).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SmsAttachment {
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+macro_rules! private_debug {
+    ($($t:ty),*) => {$(
+        /// Never prints numbers, names or text (protocol v0 §11).
+        impl std::fmt::Debug for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct(stringify!($t)).finish_non_exhaustive()
+            }
+        }
+    )*};
+}
+private_debug!(SmsThread, SmsMessage, SmsPartData, SmsAttachment, CallLogEntry, ContactNumber, Contact);
+
+/// One SIM (or calling app) this phone places calls with
+/// (docs/protocol/calls.md, `call.sims`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CallSim {
+    /// Stays the same while the SIM is in: what `call_dial_on` gets back.
+    pub id: String,
+    /// What Android shows for it, such as "SIM 1 · Airtel".
+    pub label: String,
+    /// Whether the phone calls with it without asking.
+    pub is_default: bool,
+}
+
+/// One of a PC's screens, for picking the one to view (`mirror.displays`, #442).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PcDisplay {
+    /// What `start_pc_mirror`'s `display` takes.
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    /// The PC's main screen.
+    pub primary: bool,
+}
+
+/// One call in this phone's call history (docs/protocol/calls.md).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CallLogEntry {
+    pub id: String,
+    /// Who called, or who was called ("" when withheld).
+    pub number: String,
+    /// The contact's name, when the number is a contact.
+    pub name: Option<String>,
+    /// "incoming", "outgoing", "missed" or "rejected".
+    pub direction: String,
+    /// Unix milliseconds.
+    pub date: i64,
+    /// Seconds on the call (0 when missed or not answered).
+    pub duration: u32,
+    /// The contact's photo: a JPEG of at most 16 KB.
+    pub photo: Option<Vec<u8>>,
+}
+
+/// One phone number on a contact (docs/protocol/contacts.md).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ContactNumber {
+    pub number: String,
+    pub label: Option<String>,
+}
+
+/// A contact on this phone (docs/protocol/contacts.md).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Contact {
+    pub id: String,
+    pub name: String,
+    pub numbers: Vec<ContactNumber>,
+    pub starred: bool,
+    /// A JPEG of at most 16 KB.
+    pub photo: Option<Vec<u8>>,
+}
+
+/// A call on this phone (docs/protocol/calls.md).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Call {
+    /// This app's ID for the call, the same while it lasts.
+    pub id: String,
+    pub state: CallPhase,
+    pub incoming: bool,
+    pub number: Option<String>,
+    /// The contact's name, when the number is a contact.
+    pub name: Option<String>,
+    /// The contact's photo: a JPEG of at most 64 KB, sent while ringing.
+    pub photo: Option<Vec<u8>>,
+    /// With `Ended`: it rang and nobody answered.
+    pub missed: bool,
+    /// With `Active`: when it was answered, in Unix milliseconds.
+    pub since: Option<i64>,
+    /// With `Active`, when this app controls the call (its in-call service
+    /// is bound): mute, speaker and hold.
+    pub controls: Option<CallControls>,
+    /// The app the call is in (`WhatsApp`...), when it isn't a phone call
+    /// (#434): answered, declined and ended through that app's notification.
+    #[uniffi(default = None)]
+    pub app: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct CallControls {
+    pub muted: bool,
+    pub speaker: bool,
+    pub held: bool,
+    pub can_hold: bool,
+}
+
+/// Never prints the number, name or photo (protocol v0 §11).
+impl std::fmt::Debug for Call {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Call").field("id", &self.id).field("state", &self.state).finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum CallPhase {
+    Ringing,
+    Active,
+    Ended,
+}
+
+/// What a PC asked of a call.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum CallCommand {
+    Answer,
+    /// Decline a ringing call, or hang up an active one.
+    Decline,
+    /// Stop the ringing.
+    Silence,
+    /// Mute (true) or unmute the microphone on the call.
+    Mute {
+        on: bool,
+    },
+    /// The speaker (true) or the earpiece.
+    Speaker {
+        on: bool,
+    },
+    /// Put the call on hold (true) or take it off.
+    Hold {
+        on: bool,
+    },
+    /// A keypad tone: "0"-"9", "*" or "#".
+    Dtmf {
+        digit: String,
+    },
+    /// The call's volume up (true) or down.
+    Volume {
+        up: bool,
+    },
+}
+
+/// A photo or screenshot that just appeared on this phone
+/// (docs/protocol/photos.md).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Photo {
+    /// This app's ID for it (a PC asks for it by this ID).
+    pub id: String,
+    pub name: String,
+    pub size: u64,
+    /// When it was taken, in Unix seconds.
+    pub taken: i64,
+    pub screenshot: bool,
+    /// A JPEG preview of at most 96 KB, at most 512 pixels a side.
+    pub thumb: Vec<u8>,
+}
+
+/// Never prints the name or picture (protocol v0 §11).
+impl std::fmt::Debug for Photo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Photo").field("id", &self.id).finish_non_exhaustive()
+    }
+}
+
+/// An album (folder) in this phone's gallery (docs/protocol/photos.md).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PhotoAlbum {
+    pub id: String,
+    pub name: String,
+    pub count: u32,
+    /// Newest item's ID in the album, for its cover thumbnail.
+    pub cover: Option<String>,
+}
+
+/// A photo or video in this phone's gallery (docs/protocol/photos.md).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PhotoItem {
+    pub id: String,
+    pub name: String,
+    /// Unix milliseconds.
+    pub date: i64,
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+    /// Video duration in milliseconds; `None` for still photos.
+    pub duration: Option<u32>,
+    pub album: Option<String>,
+}
+
+/// A JPEG thumbnail for a gallery item (docs/protocol/photos.md).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PhotoThumb {
+    pub id: String,
+    /// JPEG of at most 32 KiB, ~256 px on the longer side.
+    pub data: Vec<u8>,
+}
+
+/// One file or folder in a phone directory listing (`docs/protocol/storage.md`).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct StorageEntry {
+    pub name: String,
+    pub size: u64,
+    /// Unix milliseconds.
+    pub modified: i64,
+    pub is_dir: bool,
+}
+
+/// An opened file on this phone ready for ranged reading (`storage.read`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct StorageReadFile {
+    pub source: FileToSend,
+    pub size: u64,
+    /// Unix milliseconds.
+    pub modified: i64,
+}
+
+/// Result of writing a file into this phone's storage (`storage.write`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct StorageWriteDone {
+    pub size: u64,
+    /// Unix milliseconds.
+    pub modified: i64,
+}
+
+/// Whether a clipboard history item is text or an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ClipboardItemKind {
+    Text,
+    Image,
+}
+
+impl From<core::ClipboardItemKind> for ClipboardItemKind {
+    fn from(k: core::ClipboardItemKind) -> Self {
+        match k {
+            core::ClipboardItemKind::Text => ClipboardItemKind::Text,
+            core::ClipboardItemKind::Image => ClipboardItemKind::Image,
+        }
+    }
+}
+
+/// One clip in the local clipboard history.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ClipboardHistoryEntry {
+    pub id: String,
+    pub kind: ClipboardItemKind,
+    pub text: String,
+    pub mime: Option<String>,
+    pub device_name: String,
+    pub incoming: bool,
+    pub timestamp: i64,
+    pub pinned: bool,
+}
+
+impl From<core::ClipboardHistoryEntry> for ClipboardHistoryEntry {
+    fn from(e: core::ClipboardHistoryEntry) -> Self {
+        ClipboardHistoryEntry {
+            id: e.id,
+            kind: e.kind.into(),
+            text: e.text,
+            mime: e.mime,
+            device_name: e.device_name,
+            incoming: e.incoming,
+            timestamp: e.timestamp,
+            pinned: e.pinned,
+        }
+    }
+}
+
+/// Kind of cross-device activity recorded in the local timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TimelineKind {
+    File,
+    Clip,
+    Link,
+    Photo,
+    Recording,
+    Session,
+}
+
+impl From<core::TimelineKind> for TimelineKind {
+    fn from(k: core::TimelineKind) -> Self {
+        match k {
+            core::TimelineKind::File => TimelineKind::File,
+            core::TimelineKind::Clip => TimelineKind::Clip,
+            core::TimelineKind::Link => TimelineKind::Link,
+            core::TimelineKind::Photo => TimelineKind::Photo,
+            core::TimelineKind::Recording => TimelineKind::Recording,
+            core::TimelineKind::Session => TimelineKind::Session,
+        }
+    }
+}
+
+impl From<TimelineKind> for core::TimelineKind {
+    fn from(k: TimelineKind) -> Self {
+        match k {
+            TimelineKind::File => core::TimelineKind::File,
+            TimelineKind::Clip => core::TimelineKind::Clip,
+            TimelineKind::Link => core::TimelineKind::Link,
+            TimelineKind::Photo => core::TimelineKind::Photo,
+            TimelineKind::Recording => core::TimelineKind::Recording,
+            TimelineKind::Session => core::TimelineKind::Session,
+        }
+    }
+}
+
+/// One item in the local cross-device timeline.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TimelineEntry {
+    pub id: i64,
+    pub kind: TimelineKind,
+    pub device_id: String,
+    pub device_name: String,
+    pub incoming: bool,
+    pub timestamp: i64,
+    pub title: String,
+    pub detail: String,
+    pub target: String,
+    pub size_bytes: u64,
+    pub duration_secs: u64,
+    pub ref_id: Option<String>,
+    pub clip_available: bool,
+    pub image_data_url: Option<String>,
+}
+
+impl From<core::TimelineEntry> for TimelineEntry {
+    fn from(e: core::TimelineEntry) -> Self {
+        let (title, detail, target) =
+            if e.kind == core::TimelineKind::Clip && !e.title.is_empty() && e.title != "Image clip" {
+                let raw = e.title.clone();
+                let (friendly, raw_detail) = core::format_clip_display(&e.title);
+                let det = raw_detail.unwrap_or(e.detail);
+                let tgt = if e.target.is_empty() { raw } else { e.target };
+                (friendly, det, tgt)
+            } else {
+                (e.title, e.detail, e.target)
+            };
+        TimelineEntry {
+            id: e.id,
+            kind: e.kind.into(),
+            device_id: e.device_id.to_string(),
+            device_name: e.device_name,
+            incoming: e.incoming,
+            timestamp: e.timestamp,
+            title,
+            detail,
+            target,
+            size_bytes: e.size_bytes,
+            duration_secs: e.duration_secs,
+            ref_id: e.ref_id,
+            clip_available: e.clip_available,
+            image_data_url: e.image_data_url,
+        }
+    }
+}
+
+/// A paged result from the local timeline.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TimelinePage {
+    pub items: Vec<TimelineEntry>,
+    pub has_more: bool,
+    pub total: u32,
+}
+
+impl From<core::TimelinePage> for TimelinePage {
+    fn from(p: core::TimelinePage) -> Self {
+        TimelinePage {
+            items: p.entries.into_iter().map(Into::into).collect(),
+            has_more: p.has_more,
+            total: p.total,
+        }
+    }
+}
+
+/// Retention policy for the local timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct TimelineRetention {
+    pub max_days: u32,
+    pub max_entries: u32,
+}
+
+impl From<core::TimelineRetention> for TimelineRetention {
+    fn from(r: core::TimelineRetention) -> Self {
+        TimelineRetention { max_days: r.max_days, max_entries: r.max_entries }
+    }
+}
+
+/// Summary of locally stored history and cache counts for Privacy & Data settings.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DataRetentionCounts {
+    pub clipboard_items: u32,
+    pub clipboard_bytes: u64,
+    pub timeline_items: u32,
+    pub timeline_retention_days: u32,
+    pub chat_threads: u32,
+    pub chat_messages: u32,
+    pub received_file_records: u32,
+}
+
+impl From<core::DataRetentionCounts> for DataRetentionCounts {
+    fn from(c: core::DataRetentionCounts) -> Self {
+        DataRetentionCounts {
+            clipboard_items: c.clipboard_items,
+            clipboard_bytes: c.clipboard_bytes,
+            timeline_items: c.timeline_items,
+            timeline_retention_days: c.timeline_retention_days,
+            chat_threads: c.chat_threads,
+            chat_messages: c.chat_messages,
+            received_file_records: c.received_file_records,
+        }
+    }
+}
+
+/// Kind of item in the persistent outgoing send queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiQueueKind {
+    Files,
+    Folder,
+    Clipboard,
+    ClipboardImage,
+    Link,
+    HandoffDocument,
+    Recording,
+    TaskNotify,
+    CameraRequest,
+}
+
+impl From<core::QueueKind> for FfiQueueKind {
+    fn from(k: core::QueueKind) -> Self {
+        match k {
+            core::QueueKind::Files => FfiQueueKind::Files,
+            core::QueueKind::Folder => FfiQueueKind::Folder,
+            core::QueueKind::Clipboard => FfiQueueKind::Clipboard,
+            core::QueueKind::ClipboardImage => FfiQueueKind::ClipboardImage,
+            core::QueueKind::Link => FfiQueueKind::Link,
+            core::QueueKind::HandoffDocument => FfiQueueKind::HandoffDocument,
+            core::QueueKind::Recording => FfiQueueKind::Recording,
+            core::QueueKind::TaskNotify => FfiQueueKind::TaskNotify,
+            core::QueueKind::CameraRequest => FfiQueueKind::CameraRequest,
+        }
+    }
+}
+
+/// Lifecycle state of an item in the persistent outgoing send queue.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiQueueStatus {
+    Waiting,
+    Sending,
+    Failed { error: String },
+    Expired { error: String },
+}
+
+impl From<core::QueueStatus> for FfiQueueStatus {
+    fn from(s: core::QueueStatus) -> Self {
+        match s {
+            core::QueueStatus::Waiting => FfiQueueStatus::Waiting,
+            core::QueueStatus::Sending => FfiQueueStatus::Sending,
+            core::QueueStatus::Failed { error } => FfiQueueStatus::Failed { error },
+            core::QueueStatus::Expired { error } => FfiQueueStatus::Expired { error },
+        }
+    }
+}
+
+/// Source or staged file metadata for a queued file, folder, handoff, or recording item.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiQueueFile {
+    pub path: String,
+    pub name: String,
+    pub folder: Option<String>,
+    pub size: u64,
+    pub mtime_ms: i64,
+    pub staged: bool,
+}
+
+impl From<core::QueuedFileSpec> for FfiQueueFile {
+    fn from(f: core::QueuedFileSpec) -> Self {
+        FfiQueueFile {
+            path: f.path.to_string_lossy().into_owned(),
+            name: f.name,
+            folder: f.folder,
+            size: f.size,
+            mtime_ms: f.mtime_ms,
+            staged: f.staged,
+        }
+    }
+}
+
+/// One item in the persistent outgoing send queue.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiQueueItem {
+    pub id: String,
+    pub seq: i64,
+    pub device_id: String,
+    pub device_name: String,
+    pub kind: FfiQueueKind,
+    pub status: FfiQueueStatus,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub attempts: u32,
+    pub title: String,
+    pub detail: String,
+    pub bytes_total: u64,
+    pub bytes_done: u64,
+    pub files_total: u32,
+    pub files_done: u32,
+    pub files: Vec<FfiQueueFile>,
+}
+
+impl From<core::QueueItem> for FfiQueueItem {
+    fn from(i: core::QueueItem) -> Self {
+        FfiQueueItem {
+            id: i.id,
+            seq: i.seq,
+            device_id: i.peer.to_string(),
+            device_name: i.peer_name,
+            kind: i.kind.into(),
+            status: i.status.into(),
+            created_at: i.created_at,
+            expires_at: i.expires_at,
+            attempts: i.attempts,
+            title: i.title,
+            detail: i.detail,
+            bytes_total: i.bytes_total,
+            bytes_done: i.bytes_done,
+            files_total: i.files_total,
+            files_done: i.files_done,
+            files: i.files.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+private_debug!(
+    PhotoAlbum,
+    PhotoItem,
+    PhotoThumb,
+    StorageEntry,
+    ClipboardHistoryEntry,
+    TimelineEntry,
+    FfiQueueItem
+);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
+pub enum NectarlinkError {
+    #[error("device is not paired")]
+    NotPaired,
+    #[error("device is offline")]
+    Offline,
+    #[error("the operation was denied")]
+    Denied,
+    #[error("declined")]
+    Declined,
+    #[error("timed out")]
+    Timeout,
+    /// `this_device`: whether this app (true) or the other device's app
+    /// (false) needs an update.
+    #[error("an app is too old for this connection")]
+    VersionTooOld { this_device: bool },
+    #[error("not supported by the other device")]
+    Unsupported,
+    #[error("it no longer exists")]
+    NotFound,
+    #[error("too large to send")]
+    TooLarge,
+    #[error("send queue is full: {reason}")]
+    QueueFull { reason: String },
+    #[error("no pairing in progress")]
+    NotPairing,
+    #[error("invalid pairing link")]
+    InvalidPairingLink,
+    #[error("invalid device ID")]
+    InvalidDeviceId,
+    #[error("network error: {reason}")]
+    Network { reason: String },
+    #[error("storage error: {reason}")]
+    Storage { reason: String },
+    #[error("internal error: {reason}")]
+    Internal { reason: String },
+}
+
+impl From<core::Error> for NectarlinkError {
+    fn from(e: core::Error) -> Self {
+        match e {
+            core::Error::NotPaired => NectarlinkError::NotPaired,
+            core::Error::Offline => NectarlinkError::Offline,
+            core::Error::Denied => NectarlinkError::Denied,
+            core::Error::Declined => NectarlinkError::Declined,
+            core::Error::Timeout => NectarlinkError::Timeout,
+            core::Error::VersionTooOld { side } => {
+                NectarlinkError::VersionTooOld { this_device: side == core::Side::Local }
+            }
+            core::Error::Unsupported => NectarlinkError::Unsupported,
+            core::Error::NotFound => NectarlinkError::NotFound,
+            core::Error::TooLarge => NectarlinkError::TooLarge,
+            core::Error::QueueFull(reason) => NectarlinkError::QueueFull { reason },
+            core::Error::NotPairing => NectarlinkError::NotPairing,
+            core::Error::InvalidPairingLink(_) => NectarlinkError::InvalidPairingLink,
+            core::Error::Network(reason) => NectarlinkError::Network { reason },
+            core::Error::Storage(reason) => NectarlinkError::Storage { reason },
+            core::Error::Io(e) => NectarlinkError::Storage { reason: e.to_string() },
+            core::Error::Protocol(reason) | core::Error::Internal(reason) => {
+                NectarlinkError::Internal { reason }
+            }
+        }
+    }
+}
+
+type Result<T, E = NectarlinkError> = std::result::Result<T, E>;
+
+// ---- Conversions ----
+
+impl From<core::DeviceKind> for DeviceKind {
+    fn from(kind: core::DeviceKind) -> Self {
+        match kind {
+            core::DeviceKind::Phone => DeviceKind::Phone,
+            core::DeviceKind::Tablet => DeviceKind::Tablet,
+            core::DeviceKind::Desktop => DeviceKind::Desktop,
+            core::DeviceKind::Laptop => DeviceKind::Laptop,
+            core::DeviceKind::Unknown => DeviceKind::Unknown,
+        }
+    }
+}
+
+impl From<DeviceKind> for core::DeviceKind {
+    fn from(kind: DeviceKind) -> Self {
+        match kind {
+            DeviceKind::Phone => core::DeviceKind::Phone,
+            DeviceKind::Tablet => core::DeviceKind::Tablet,
+            DeviceKind::Desktop => core::DeviceKind::Desktop,
+            DeviceKind::Laptop => core::DeviceKind::Laptop,
+            DeviceKind::Unknown => core::DeviceKind::Unknown,
+        }
+    }
+}
+
+impl From<core::ScreenRect> for ScreenRect {
+    fn from(r: core::ScreenRect) -> Self {
+        ScreenRect { x: r.x, y: r.y, w: r.w, h: r.h }
+    }
+}
+
+impl From<ScreenRect> for core::ScreenRect {
+    fn from(r: ScreenRect) -> Self {
+        core::ScreenRect { x: r.x, y: r.y, w: r.w, h: r.h }
+    }
+}
+
+impl From<core::ScreenCorners> for ScreenCorners {
+    fn from(c: core::ScreenCorners) -> Self {
+        ScreenCorners { tl: c.tl, tr: c.tr, br: c.br, bl: c.bl }
+    }
+}
+
+impl From<ScreenCorners> for core::ScreenCorners {
+    fn from(c: ScreenCorners) -> Self {
+        core::ScreenCorners { tl: c.tl, tr: c.tr, br: c.br, bl: c.bl }
+    }
+}
+
+impl From<core::ScreenShape> for ScreenShape {
+    fn from(s: core::ScreenShape) -> Self {
+        ScreenShape {
+            v: s.v,
+            aspect: s.aspect,
+            corners: s.corners.map(Into::into),
+            cutouts: s.cutouts.into_iter().map(Into::into).collect(),
+            cutout_path: s.cutout_path,
+        }
+    }
+}
+
+impl From<ScreenShape> for core::ScreenShape {
+    fn from(s: ScreenShape) -> Self {
+        core::ScreenShape {
+            v: s.v,
+            aspect: s.aspect,
+            corners: s.corners.map(Into::into),
+            cutouts: s.cutouts.into_iter().map(Into::into).collect(),
+            cutout_path: s.cutout_path,
+        }
+    }
+}
+
+impl From<core::DeviceInfo> for DeviceInfo {
+    fn from(i: core::DeviceInfo) -> Self {
+        DeviceInfo {
+            name: i.name,
+            kind: i.kind.into(),
+            os: i.os,
+            os_version: i.os_ver,
+            model: i.model,
+            accent: i.accent,
+            screen: i.screen.map(Into::into),
+            install_id: i.install_id,
+        }
+    }
+}
+
+impl From<DeviceInfo> for core::DeviceInfo {
+    fn from(i: DeviceInfo) -> Self {
+        core::DeviceInfo {
+            name: i.name,
+            kind: i.kind.into(),
+            os: i.os,
+            os_ver: i.os_version,
+            model: i.model,
+            accent: i.accent,
+            screen: i.screen.map(Into::into),
+            install_id: i.install_id,
+        }
+        .sanitized()
+    }
+}
+
+impl From<core::PowerLevel> for PowerLevel {
+    fn from(p: core::PowerLevel) -> Self {
+        match p.effective() {
+            core::PowerLevel::Assist => PowerLevel::Assist,
+            core::PowerLevel::Elevated => PowerLevel::Elevated,
+            core::PowerLevel::NotApplicable => PowerLevel::NotApplicable,
+            core::PowerLevel::Basic | core::PowerLevel::Unknown => PowerLevel::Basic,
+        }
+    }
+}
+
+impl From<PowerLevel> for core::PowerLevel {
+    fn from(p: PowerLevel) -> Self {
+        match p {
+            PowerLevel::Basic => core::PowerLevel::Basic,
+            PowerLevel::Assist => core::PowerLevel::Assist,
+            PowerLevel::Elevated => core::PowerLevel::Elevated,
+            PowerLevel::NotApplicable => core::PowerLevel::NotApplicable,
+        }
+    }
+}
+
+impl From<core::Battery> for Battery {
+    fn from(b: core::Battery) -> Self {
+        Battery {
+            level: b.level,
+            charging: b.charging,
+            plugged: b.plugged,
+            full_in: b.full_in,
+            cell_bars: b.cell_bars,
+            cell_type: b.cell_type,
+            wifi_bars: b.wifi_bars,
+        }
+    }
+}
+
+impl From<Battery> for core::Battery {
+    fn from(b: Battery) -> Self {
+        core::Battery {
+            level: b.level.min(100),
+            charging: b.charging,
+            plugged: b.plugged,
+            full_in: b.full_in,
+            cell_bars: b.cell_bars,
+            cell_type: b.cell_type,
+            wifi_bars: b.wifi_bars,
+        }
+        .sanitized()
+    }
+}
+
+impl From<LinkState> for Link {
+    fn from(l: LinkState) -> Self {
+        match l {
+            LinkState::Offline { last_seen } => Link::Offline { last_seen },
+            LinkState::Connecting => Link::Connecting,
+            LinkState::Online { path, rtt_ms } => Link::Online {
+                relayed: path == ConnectionPath::Relay,
+                usb: path == ConnectionPath::Usb,
+                rtt_ms,
+            },
+        }
+    }
+}
+
+impl From<core::PairedDevice> for PairedDevice {
+    fn from(d: core::PairedDevice) -> Self {
+        PairedDevice {
+            id: d.id.to_string(),
+            info: d.info.into(),
+            paired_at: d.paired_at,
+            link: d.link.into(),
+            can_wake: d.can_wake,
+            reconnect: d.reconnect,
+        }
+    }
+}
+
+impl From<core::DiscoveredDevice> for DiscoveredDevice {
+    fn from(d: core::DiscoveredDevice) -> Self {
+        DiscoveredDevice { id: d.id.to_string(), name: d.name }
+    }
+}
+
+impl From<core::LocalSendPeer> for LocalSendPeer {
+    fn from(p: core::LocalSendPeer) -> Self {
+        LocalSendPeer {
+            id: p.id.to_string(),
+            alias: p.alias,
+            device_model: p.device_model,
+            device_type: p.device_type,
+            fingerprint: p.fingerprint,
+            ip: p.ip,
+            port: p.port,
+            protocol: p.protocol,
+        }
+    }
+}
+
+impl From<core::PairingFailure> for PairingFailure {
+    fn from(f: core::PairingFailure) -> Self {
+        match f {
+            core::PairingFailure::Rejected => PairingFailure::Rejected,
+            core::PairingFailure::Declined => PairingFailure::Declined,
+            core::PairingFailure::Expired => PairingFailure::Expired,
+            core::PairingFailure::Unreachable => PairingFailure::Unreachable,
+            core::PairingFailure::Other(message) => PairingFailure::Other { message },
+        }
+    }
+}
+
+impl From<core::LiveSegment> for LiveSegment {
+    fn from(s: core::LiveSegment) -> Self {
+        LiveSegment { length: s.length, color: s.color }
+    }
+}
+
+impl From<LiveSegment> for core::LiveSegment {
+    fn from(s: LiveSegment) -> Self {
+        core::LiveSegment { length: s.length, color: s.color }
+    }
+}
+
+impl From<core::LivePoint> for LivePoint {
+    fn from(p: core::LivePoint) -> Self {
+        LivePoint { position: p.position, color: p.color }
+    }
+}
+
+impl From<LivePoint> for core::LivePoint {
+    fn from(p: LivePoint) -> Self {
+        core::LivePoint { position: p.position, color: p.color }
+    }
+}
+
+impl From<core::NotificationLive> for NotificationLive {
+    fn from(l: core::NotificationLive) -> Self {
+        NotificationLive {
+            v: l.v,
+            progress: l.progress,
+            max: l.max,
+            indeterminate: l.indeterminate,
+            chip: l.chip,
+            segments: l.segments.into_iter().map(Into::into).collect(),
+            points: l.points.into_iter().map(Into::into).collect(),
+            chronometer: l.chronometer,
+            countdown: l.countdown,
+        }
+    }
+}
+
+impl From<NotificationLive> for core::NotificationLive {
+    fn from(l: NotificationLive) -> Self {
+        core::NotificationLive {
+            v: l.v,
+            progress: l.progress,
+            max: l.max,
+            indeterminate: l.indeterminate,
+            chip: l.chip,
+            segments: l.segments.into_iter().map(Into::into).collect(),
+            points: l.points.into_iter().map(Into::into).collect(),
+            chronometer: l.chronometer,
+            countdown: l.countdown,
+        }
+    }
+}
+
+impl From<core::TaskNotify> for TaskNotify {
+    fn from(t: core::TaskNotify) -> Self {
+        TaskNotify {
+            id: t.id,
+            title: t.title,
+            active: t.active,
+            elapsed_ms: t.elapsed_ms,
+            exit_code: t.exit_code,
+        }
+    }
+}
+
+impl From<TaskNotify> for core::TaskNotify {
+    fn from(t: TaskNotify) -> Self {
+        core::TaskNotify {
+            id: t.id,
+            title: t.title,
+            active: t.active,
+            elapsed_ms: t.elapsed_ms,
+            exit_code: t.exit_code,
+        }
+    }
+}
+
+impl From<core::NotificationChatMessage> for NotificationChatMessage {
+    fn from(m: core::NotificationChatMessage) -> Self {
+        NotificationChatMessage {
+            sender: m.sender,
+            text: m.text,
+            time: m.time,
+            self_sent: m.self_sent,
+            avatar: m.avatar,
+        }
+    }
+}
+
+impl From<NotificationChatMessage> for core::NotificationChatMessage {
+    fn from(m: NotificationChatMessage) -> Self {
+        core::NotificationChatMessage {
+            sender: m.sender,
+            text: m.text,
+            time: m.time,
+            self_sent: m.self_sent,
+            avatar: m.avatar,
+        }
+    }
+}
+
+impl From<core::NotificationConversation> for NotificationConversation {
+    fn from(c: core::NotificationConversation) -> Self {
+        NotificationConversation {
+            v: c.v,
+            title: c.title,
+            group: c.group,
+            avatar: c.avatar,
+            messages: c.messages.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<NotificationConversation> for core::NotificationConversation {
+    fn from(c: NotificationConversation) -> Self {
+        core::NotificationConversation {
+            v: c.v,
+            title: c.title,
+            group: c.group,
+            avatar: c.avatar,
+            messages: c.messages.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<core::SmsAttachment> for SmsAttachment {
+    fn from(a: core::SmsAttachment) -> Self {
+        SmsAttachment { mime: a.mime, data: a.data }
+    }
+}
+
+impl From<SmsAttachment> for core::SmsAttachment {
+    fn from(a: SmsAttachment) -> Self {
+        core::SmsAttachment { mime: a.mime, data: a.data }
+    }
+}
+
+impl From<core::Notification> for Notification {
+    fn from(n: core::Notification) -> Self {
+        Notification {
+            key: n.key,
+            app: n.app,
+            app_name: n.app_name,
+            title: n.title,
+            text: n.text,
+            sub: n.sub,
+            when: n.when,
+            actions: n
+                .actions
+                .into_iter()
+                .map(|a| NotificationAction { id: a.id, title: a.title, reply: a.reply })
+                .collect(),
+            silent: n.silent,
+            ongoing: n.ongoing,
+            icon: n.icon,
+            image: n.image,
+            live: n.live.map(Into::into),
+            conversation: n.conversation.map(Into::into),
+        }
+    }
+}
+
+impl From<Notification> for core::Notification {
+    fn from(n: Notification) -> Self {
+        core::Notification {
+            key: n.key,
+            app: n.app,
+            app_name: n.app_name,
+            title: n.title,
+            text: n.text,
+            sub: n.sub,
+            when: n.when,
+            actions: n
+                .actions
+                .into_iter()
+                .map(|a| core::NotificationAction { id: a.id, title: a.title, reply: a.reply })
+                .collect(),
+            silent: n.silent,
+            ongoing: n.ongoing,
+            icon: n.icon,
+            image: n.image,
+            live: n.live.map(Into::into),
+            conversation: n.conversation.map(Into::into),
+        }
+    }
+}
+
+impl From<core::RecordingMarker> for RecordingMarker {
+    fn from(m: core::RecordingMarker) -> Self {
+        RecordingMarker { at_ms: m.at_ms, label: m.label }
+    }
+}
+
+impl From<RecordingMarker> for core::RecordingMarker {
+    fn from(m: RecordingMarker) -> Self {
+        core::RecordingMarker { at_ms: m.at_ms, label: m.label }
+    }
+}
+
+impl From<core::Transfer> for Transfer {
+    fn from(t: core::Transfer) -> Self {
+        Transfer {
+            id: t.id,
+            device_id: t.device.to_string(),
+            direction: match t.direction {
+                core::Direction::Outgoing => TransferDirection::Outgoing,
+                core::Direction::Incoming => TransferDirection::Incoming,
+            },
+            names: t.names,
+            files: u32::try_from(t.files).unwrap_or(u32::MAX),
+            total: t.total,
+            done: t.done,
+            status: match t.state {
+                core::TransferState::Requested => TransferStatus::Requested,
+                core::TransferState::Waiting => TransferStatus::Waiting,
+                core::TransferState::Running => TransferStatus::Running,
+                core::TransferState::Paused => TransferStatus::Paused,
+                core::TransferState::Done { saved } => TransferStatus::Done {
+                    saved: saved.into_iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+                },
+                core::TransferState::Failed(failure) => TransferStatus::Failed {
+                    reason: match failure {
+                        core::TransferFailure::Denied => "denied",
+                        core::TransferFailure::Unreachable => "unreachable",
+                        core::TransferFailure::NoSpace => "noSpace",
+                        core::TransferFailure::Interrupted => "interrupted",
+                        core::TransferFailure::Integrity => "integrity",
+                        core::TransferFailure::Other(_) => "other",
+                    }
+                    .into(),
+                },
+                core::TransferState::Cancelled => TransferStatus::Cancelled,
+            },
+            recording: t.recording,
+            markers: t.markers.into_iter().map(Into::into).collect(),
+            open_on_arrival: t.open_on_arrival,
+        }
+    }
+}
+
+fn file_to_send(file: FileToSend) -> Result<core::OutgoingFile> {
+    Ok(match file {
+        FileToSend::Path { name, path, folder } => {
+            core::OutgoingFile { name, folder, source: core::FileSource::Path(path.into()) }
+        }
+        #[cfg(unix)]
+        FileToSend::Fd { name, fd, folder } => {
+            use std::os::fd::FromRawFd;
+            if fd < 0 {
+                return Err(NectarlinkError::Internal { reason: "invalid file descriptor".into() });
+            }
+            // SAFETY: the caller hands over an open descriptor it no longer
+            // uses (documented on `FileToSend::Fd`); the File closes it.
+            #[allow(unsafe_code)]
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            core::OutgoingFile { name, folder, source: core::FileSource::File(file) }
+        }
+        #[cfg(not(unix))]
+        FileToSend::Fd { .. } => {
+            return Err(NectarlinkError::Internal {
+                reason: "file descriptors exist only on Android".into(),
+            });
+        }
+    })
+}
+
+/// Converts every item first so all valid descriptors are owned by `File` (and
+/// closed on drop) even when one item or a later check fails.
+fn files_to_send(files: Vec<FileToSend>) -> Result<Vec<core::OutgoingFile>> {
+    let mut out = Vec::with_capacity(files.len());
+    let mut first_err: Option<NectarlinkError> = None;
+    for f in files {
+        match file_to_send(f) {
+            Ok(outgoing) => out.push(outgoing),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+    Ok(out)
+}
+
+fn upgrade(u: core::features::Upgrade) -> Upgrade {
+    let (action, target) = u.action.describe();
+    Upgrade { action: action.into(), target, minutes: u.effort.minutes() }
+}
+
+impl From<FeatureState> for FeatureStatus {
+    fn from(state: FeatureState) -> Self {
+        match state {
+            FeatureState::Available => FeatureStatus::Available,
+            FeatureState::Partial { limit, upgrade: u } => {
+                FeatureStatus::Partial { limit: limit.into(), upgrade: u.map(upgrade) }
+            }
+            FeatureState::Locked { upgrade: u } => FeatureStatus::Locked { upgrade: upgrade(u) },
+            FeatureState::Unsupported { reason } => FeatureStatus::Unsupported { reason: reason.describe() },
+        }
+    }
+}
+
+fn features(matrix: &CapabilityMatrix) -> Vec<Feature> {
+    matrix.features.iter().map(|(id, state)| Feature { id: (*id).into(), status: (*state).into() }).collect()
+}
+
+impl Event {
+    fn from_node(event: NodeEvent) -> Option<Self> {
+        Some(match event {
+            NodeEvent::DeviceAdded(device) => Event::DeviceAdded { device: device.into() },
+            NodeEvent::DeviceRemoved(id) => Event::DeviceRemoved { id: id.to_string() },
+            NodeEvent::LinkChanged { device, link } => {
+                Event::LinkChanged { id: device.to_string(), link: link.into() }
+            }
+            NodeEvent::PeerInfoChanged { device, info } => {
+                Event::PeerInfoChanged { id: device.to_string(), info: info.into() }
+            }
+            NodeEvent::PeerPowerChanged { device, power } => {
+                Event::PeerPowerChanged { id: device.to_string(), power: power.into() }
+            }
+            NodeEvent::UpdateHint { device, channel, version } => {
+                Event::UpdateHint { id: device.to_string(), channel, version }
+            }
+            NodeEvent::Battery { device, battery } => {
+                Event::Battery { id: device.to_string(), battery: battery.into() }
+            }
+            NodeEvent::Ring { device, on } => Event::Ring { id: device.to_string(), on },
+            NodeEvent::RemoteRing { device, on } => Event::RemoteRing { id: device.to_string(), on },
+            NodeEvent::Discovered(device) => Event::Discovered { device: device.into() },
+            NodeEvent::DiscoveryExpired(id) => Event::DiscoveryExpired { id: id.to_string() },
+            NodeEvent::Pairing(PairingEvent::SasCode { peer, code }) => {
+                Event::PairingCode { peer: peer.to_string(), code }
+            }
+            NodeEvent::Pairing(PairingEvent::Paired(device)) => Event::Paired { device: device.into() },
+            NodeEvent::Pairing(PairingEvent::Failed(failure)) => {
+                Event::PairingFailed { failure: failure.into() }
+            }
+            NodeEvent::Capabilities(matrix) => {
+                Event::Capabilities { id: matrix.device.to_string(), features: features(&matrix) }
+            }
+            NodeEvent::NotificationsReset { device, items } => Event::NotificationsReset {
+                id: device.to_string(),
+                items: items.into_iter().map(Into::into).collect(),
+            },
+            NodeEvent::NotificationPosted { device, notification } => {
+                Event::NotificationPosted { id: device.to_string(), notification: notification.into() }
+            }
+            NodeEvent::NotificationRemoved { device, key } => {
+                Event::NotificationRemoved { id: device.to_string(), key }
+            }
+            NodeEvent::ClipboardReceived { device } => Event::ClipboardReceived { id: device.to_string() },
+            NodeEvent::ClipboardHistoryChanged => Event::ClipboardHistoryChanged,
+            NodeEvent::Transfer(t) => Event::Transfer { transfer: t.into() },
+            NodeEvent::MediaChanged { device, players } => Event::MediaChanged {
+                id: device.to_string(),
+                players: players.into_iter().map(Into::into).collect(),
+            },
+            NodeEvent::PhotoAdded { device, photo } => {
+                Event::PhotoAdded { id: device.to_string(), photo_id: photo.id }
+            }
+            NodeEvent::Call { device, call } => {
+                Event::CallChanged { id: device.to_string(), call_id: call.id }
+            }
+            NodeEvent::CallLogChanged { device } => Event::CallLogChanged { id: device.to_string() },
+            NodeEvent::ContactsChanged { device } => Event::ContactsChanged { id: device.to_string() },
+            NodeEvent::DiagLogAsked { device } => Event::DiagLogAsked { id: device.to_string() },
+            NodeEvent::DiagLog { device, nonce, lines } => {
+                let shared = lines.is_some();
+                if !peer_log_arrived(device, nonce, lines) {
+                    return None;
+                }
+                Event::ReportLogArrived { id: device.to_string(), shared }
+            }
+            NodeEvent::SmsChanged { device, thread } => Event::SmsChanged { id: device.to_string(), thread },
+            NodeEvent::PhotosChanged { device } => Event::PhotosChanged { id: device.to_string() },
+            NodeEvent::Mirroring { device, session, on } => {
+                Event::Mirroring { id: device.to_string(), session, on }
+            }
+            NodeEvent::MirrorNotice { device, session: core::MIRROR_SCREEN, code }
+                if code == core::MIRROR_NOTICE_PC_CAPTURE_FAILED =>
+            {
+                Event::PcMirrorCaptureFailed { id: device.to_string() }
+            }
+            NodeEvent::Webcam { device, on } => Event::Webcam { id: device.to_string(), on },
+            NodeEvent::CameraCaptureRequested { .. }
+            | NodeEvent::CameraCaptureReceived { .. }
+            | NodeEvent::CameraCaptureCancelled { .. }
+            | NodeEvent::PcMirrorRequested { .. }
+            // Shown on PCs only.
+            | NodeEvent::MirrorNotice { .. }
+            // A phone's microphone arrives on PCs only.
+            | NodeEvent::Mic { .. } => return None,
+            NodeEvent::RemoteInputRequested { device } => {
+                Event::RemoteInputRequested { id: device.to_string() }
+            }
+            NodeEvent::PhoneToggles { device, toggles } => {
+                Event::PhoneToggles { id: device.to_string(), toggles: toggles.into() }
+            }
+            NodeEvent::WakeInfoChanged { device, can_wake } => {
+                Event::WakeInfoChanged { id: device.to_string(), can_wake }
+            }
+            NodeEvent::ReconnectChanged { device, on } => {
+                Event::ReconnectChanged { id: device.to_string(), on }
+            }
+            NodeEvent::DeckLayout { device, layout } => {
+                Event::DeckLayout { id: device.to_string(), layout: layout.into() }
+            }
+            NodeEvent::DeckState { device, state } => {
+                Event::DeckState { id: device.to_string(), state: state.into() }
+            }
+            NodeEvent::StorageRequested { device } => Event::StorageRequested { id: device.to_string() },
+            NodeEvent::StorageChanged { device, path } => {
+                Event::StorageChanged { id: device.to_string(), path }
+            }
+            NodeEvent::TimelineChanged => Event::TimelineChanged,
+            NodeEvent::LocalSendChanged => Event::LocalSendChanged,
+            NodeEvent::QueueChanged => Event::QueueChanged,
+            NodeEvent::QueueDroppedOnUnpair { peer, peer_name, dropped_count } => {
+                Event::QueueDroppedOnUnpair {
+                    device_id: peer.to_string(),
+                    device_name: peer_name,
+                    dropped_count,
+                }
+            }
+            NodeEvent::PcAudioFrame { device, sample_rate, channels, pcm } => {
+                Event::PcAudioFrame { device: device.to_string(), sample_rate, channels, pcm }
+            }
+            NodeEvent::CallAudioUplink { device, pcm } => Event::CallAudioUplink { device: device.to_string(), pcm },
+        })
+    }
+}
+
+fn parse_id(id: &str) -> Result<DeviceId> {
+    id.parse().map_err(|_| NectarlinkError::InvalidDeviceId)
+}
+
+// ---- Foreign interfaces (implemented in Kotlin) ----
+
+/// Why the phone declined a PC unlock operation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
+pub enum UnlockRefusal {
+    /// The owner said no, or didn't confirm in time.
+    #[error("declined")]
+    Declined,
+    /// No strong biometric enrolled, or no secure key storage.
+    #[error("unsupported")]
+    Unsupported,
+    /// The key is gone (a fingerprint was added, or app data cleared).
+    #[error("key gone")]
+    KeyGone,
+}
+
+impl From<UnlockRefusal> for core::unlock::KeyRefusal {
+    fn from(r: UnlockRefusal) -> Self {
+        match r {
+            UnlockRefusal::Declined => core::unlock::KeyRefusal::Declined,
+            UnlockRefusal::Unsupported => core::unlock::KeyRefusal::Unsupported,
+            UnlockRefusal::KeyGone => core::unlock::KeyRefusal::KeyGone,
+        }
+    }
+}
+
+/// Why a notification couldn't be dismissed or its action run.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
+pub enum NotificationFailure {
+    /// The notification or action is gone.
+    #[error("no longer exists")]
+    NotFound,
+    /// Not possible here (e.g. notification access was revoked).
+    #[error("not available")]
+    Unsupported,
+    /// `reason` is for logs; never put notification content in it.
+    #[error("failed: {reason}")]
+    Failed { reason: String },
+}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for NotificationFailure {
+    fn from(e: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        NotificationFailure::Failed { reason: e.reason }
+    }
+}
+
+impl From<NotificationFailure> for core::NotificationError {
+    fn from(f: NotificationFailure) -> Self {
+        match f {
+            NotificationFailure::NotFound => core::NotificationError::NotFound,
+            NotificationFailure::Unsupported => core::NotificationError::Unsupported,
+            NotificationFailure::Failed { reason } => core::NotificationError::Failed(reason),
+        }
+    }
+}
+
+/// Why a media command didn't run.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
+pub enum MediaFailure {
+    /// The player is gone.
+    #[error("no such player")]
+    NotFound,
+    /// The player can't do that (or media access was revoked).
+    #[error("not available")]
+    Unsupported,
+    /// `reason` is for logs.
+    #[error("failed: {reason}")]
+    Failed { reason: String },
+}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for MediaFailure {
+    fn from(e: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        MediaFailure::Failed { reason: e.reason }
+    }
+}
+
+impl From<MediaFailure> for core::MediaError {
+    fn from(f: MediaFailure) -> Self {
+        match f {
+            MediaFailure::NotFound => core::MediaError::NotFound,
+            MediaFailure::Unsupported => core::MediaError::Unsupported,
+            MediaFailure::Failed { reason } => core::MediaError::Failed(reason),
+        }
+    }
+}
+
+/// Why a phone storage operation failed (`docs/protocol/storage.md`).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
+pub enum StorageFailure {
+    #[error("no longer exists")]
+    NotFound,
+    #[error("access denied")]
+    Denied,
+    #[error("invalid path: {reason}")]
+    Invalid { reason: String },
+    #[error("not enough space")]
+    NoSpace,
+    #[error("not available")]
+    Unsupported,
+    #[error("failed: {reason}")]
+    Failed { reason: String },
+}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for StorageFailure {
+    fn from(e: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        StorageFailure::Failed { reason: e.reason }
+    }
+}
+
+impl From<StorageFailure> for core::StorageError {
+    fn from(f: StorageFailure) -> Self {
+        match f {
+            StorageFailure::NotFound => core::StorageError::NotFound,
+            StorageFailure::Denied => core::StorageError::Denied,
+            StorageFailure::Invalid { reason } => core::StorageError::Invalid(reason),
+            StorageFailure::NoSpace => core::StorageError::NoSpace,
+            StorageFailure::Unsupported => core::StorageError::Unsupported,
+            StorageFailure::Failed { reason } => core::StorageError::Failed(reason),
+        }
+    }
+}
+
+/// What the app does for the core: ring the phone, act on its
+/// notifications.
+#[uniffi::export(with_foreign)]
+pub trait Platform: Send + Sync {
+    /// Ring loudly, even in silent mode, until `stop_ringing`.
+    fn start_ringing(&self);
+    fn stop_ringing(&self);
+    /// A PC dismissed this notification.
+    fn dismiss_notification(&self, key: String) -> Result<(), NotificationFailure>;
+    /// A PC ran this notification's action; `reply` is the text for a reply
+    /// action.
+    fn run_notification_action(
+        &self,
+        key: String,
+        action: String,
+        reply: Option<String>,
+    ) -> Result<(), NotificationFailure>;
+    /// A PC sent this text: put it on the clipboard. False if that failed.
+    fn set_clipboard(&self, text: String) -> bool;
+    /// A PC sent this text (with optional HTML and RTF rich text): put it on
+    /// the clipboard. False if that failed.
+    fn set_clipboard_rich(&self, text: String, html: Option<String>, rtf: Option<String>) -> bool;
+    /// A PC sent a password or the like: put it on the clipboard marked
+    /// sensitive. False if that failed.
+    fn set_clipboard_private(&self, text: String) -> bool;
+    /// Takes that password off the clipboard, if it's still what's there.
+    fn clear_clipboard_private(&self, text: String);
+    /// A PC sent this image (`image/png` or `image/jpeg`): put it on the
+    /// clipboard. False if that failed.
+    fn set_clipboard_image(&self, mime: String, bytes: Vec<u8>) -> bool;
+    /// A paired device asked one of this phone's media players to do
+    /// something; `position` (milliseconds) is set for seeking.
+    fn media_command(
+        &self,
+        player: String,
+        action: MediaAction,
+        position: Option<u64>,
+    ) -> Result<(), MediaFailure>;
+    /// Whether a computer could be reaching this phone through adb right now
+    /// (USB debugging on with a cable in, or wireless debugging on). Pairing
+    /// over the USB tunnel without pairing mode is taken only then.
+    fn adb_may_be_connected(&self) -> bool;
+    /// A paired PC sent a web link (http or https, checked) to open.
+    /// False if it couldn't be shown.
+    fn open_link(&self, from_id: String, url: String) -> bool;
+    /// Play on phone: a paired PC offers to stream what its `player` plays
+    /// (`title`). Show the offer; taking it starts PC mirroring with
+    /// `watch` set to `player`, or with `file`, plays that video file read
+    /// with `watch_file_read`. False if it couldn't be shown.
+    fn watch_offered(
+        &self,
+        from_id: String,
+        player: String,
+        title: Option<String>,
+        file: Option<WatchFileOffer>,
+    ) -> bool;
+    /// A paired PC sent an ongoing or completed task notification (`task.notify`).
+    /// False if it couldn't be shown.
+    fn task_notify(&self, from_id: String, task: TaskNotify) -> bool;
+    /// A PC asked for a photo or video from the gallery: open it, or
+    /// `null` when it's gone.
+    fn open_photo(&self, id: String) -> Option<FileToSend>;
+    /// A PC asked for this phone's photo albums (folders), Camera and
+    /// Screenshots first, then by count.
+    fn photo_albums(&self) -> Vec<PhotoAlbum>;
+    /// A PC asked for photos and videos in `album` (or all when null),
+    /// newest first by date, then by media ID (highest first). When
+    /// `before` is set, only items after the previous page's last one:
+    /// older than `before`, or of that date with an ID below `before_id`
+    /// (none of that date when `before_id` is empty).
+    fn photo_list(
+        &self,
+        album: Option<String>,
+        before: Option<i64>,
+        before_id: String,
+        limit: u32,
+    ) -> Vec<PhotoItem>;
+    /// A PC asked for small JPEG thumbnails (at most 32 KiB each) for
+    /// these gallery item IDs.
+    fn photo_thumbs(&self, ids: Vec<String>) -> Vec<PhotoThumb>;
+    /// A PC asked to move these gallery items to the trash. Returns how many went.
+    fn photo_delete(&self, ids: Vec<String>) -> u32;
+    /// A PC asked to answer, decline or silence call `id` (the call in
+    /// progress). False if the phone couldn't.
+    fn call_command(&self, id: String, command: CallCommand) -> bool;
+    /// A PC asked for recent calls before `before` (Unix ms; the latest when
+    /// null), newest first.
+    fn call_log(&self, before: Option<i64>, limit: u32) -> Vec<CallLogEntry>;
+    /// A PC asked to call `number` (or open the dialer with it filled in).
+    /// False if the phone couldn't.
+    fn call_dial(&self, number: String) -> bool;
+    /// A PC asked which SIMs this phone calls with.
+    fn call_sims(&self) -> Vec<CallSim>;
+    /// Like `call_dial`, on the SIM `sim` (an id from `call_sims`).
+    fn call_dial_on(&self, number: String, sim: String) -> bool;
+    /// A PC asked for contacts matching `query` (or all with phone numbers
+    /// when null), favorites first then alphabetical, skipping `offset`.
+    fn contacts(&self, query: Option<String>, offset: u32, limit: u32) -> Vec<Contact>;
+    /// This phone's part of a problem report a paired PC is making: what it
+    /// says about itself and its checks (`Reports.phone`).
+    fn diag_facts(&self) -> Option<ReportDevice>;
+    /// A PC asked for this phone's screen (and, with `audio`, its sound):
+    /// ask the user (then call `mirror_open`, and `mirror_open_audio` for
+    /// the sound). With `app` (and a `session` other than 0): run that app
+    /// on a display of its own and stream it with `mirror_open`, its config
+    /// packets carrying the session. False if it can't.
+    fn mirror_requested(&self, pc_id: String, options: MirrorOptions) -> bool;
+    /// A PC asked to uninstall `pkg` (D349): true once it's gone.
+    fn app_uninstall_requested(&self, pc_id: String, pkg: String) -> bool;
+    /// The PC stopped watching the screen (session 0) or an app window.
+    fn mirror_stop_requested(&self, pc_id: String, session: u32);
+    /// The PC needs a keyframe.
+    fn mirror_keyframe_requested(&self, pc_id: String, session: u32);
+    /// The PC resized an app window (`session` != 0) to `width × height`,
+    /// the app drawing at `zoom` percent of its usual size.
+    fn mirror_resize_requested(&self, pc_id: String, session: u32, width: u32, height: u32, zoom: u32);
+    /// The PC updated `stay_awake` or `screen_off` while mirroring the screen (`session == 0`).
+    fn mirror_power_requested(&self, pc_id: String, stay_awake: bool, screen_off: bool);
+    /// The PC wants the mirrored screen in landscape or portrait.
+    fn mirror_rotate_requested(&self, pc_id: String, landscape: bool);
+    /// The PC wants the phone's sound sent to it, or left on the phone, while
+    /// mirroring the screen.
+    fn mirror_sound_requested(&self, pc_id: String, on: bool);
+    /// The PC's mouse or keyboard on the mirrored screen (only while this
+    /// phone offers `mirror.input`) or an app window. Return quickly.
+    fn mirror_input(&self, pc_id: String, session: u32, input: MirrorInputEvent);
+    /// The PC's mouse came over the edge of its screen (#107), at the phone's
+    /// `edge` ("left" or "right"), `y` (0 to 1) of the way down: show a
+    /// pointer there (Elevated). None when it can't. Not on the main thread;
+    /// may take a second.
+    fn pointer_enter(&self, pc_id: String, edge: String, y: f32) -> Option<PointerScreen>;
+    /// The PC's mouse moved by `dx`, `dy` counts with `buttons` held (bits:
+    /// 1 left, 2 right, 4 middle) and the wheel turned `wheel` notches. Return quickly.
+    fn pointer_move(&self, pc_id: String, dx: i32, dy: i32, buttons: u8, wheel: i8);
+    /// Where the pointer is; None when it isn't showing.
+    fn pointer_where(&self, pc_id: String) -> Option<PointerPosition>;
+    /// The PC's mouse went back to the PC: put the pointer away.
+    fn pointer_leave(&self, pc_id: String);
+    /// A PC asked for this phone's camera as a webcam: start streaming (or
+    /// ask the user) and call `webcam_open`. False if it can't or the user
+    /// declined.
+    fn webcam_requested(&self, pc_id: String, options: WebcamOptions) -> bool;
+    /// The PC stopped watching the webcam stream.
+    fn webcam_stop_requested(&self, pc_id: String);
+    /// A PC asked for this phone's microphone (`docs/protocol/mic.md`): ask
+    /// the user, then stream with `mic_open`. False if it couldn't ask.
+    fn mic_requested(&self, pc_id: String) -> bool;
+    /// The PC stopped listening to this phone's microphone: stop recording.
+    fn mic_stop_requested(&self, pc_id: String);
+    /// A PC asked for call `call_id`'s sound (`call.audio.start`): get ready
+    /// to carry it, then stream with `call_audio_open`. False refuses.
+    fn call_audio_requested(&self, pc_id: String, call_id: String) -> bool;
+    /// The PC stopped taking the call's sound: give it back to the phone.
+    fn call_audio_stop_requested(&self, pc_id: String);
+    /// The PC needs a fresh H.264 keyframe on the webcam stream.
+    fn webcam_keyframe_requested(&self, pc_id: String);
+    /// A PC asked this phone to capture a photo or scan a document (`mode` is
+    /// `"photo"` or `"scan"`). Return `true` if the capture UI was launched.
+    fn camera_capture_requested(&self, pc_id: String, request_id: String, mode: String) -> bool;
+    /// The PC cancelled an in-flight Continuity Camera capture request.
+    fn camera_capture_cancelled(&self, pc_id: String, request_id: String);
+    /// A PC asked for the apps it may open in windows (launchable ones).
+    fn phone_apps(&self) -> Vec<PhoneApp>;
+    /// A PC asked for the latest conversations, newest first.
+    fn sms_threads(&self, limit: u32) -> Vec<SmsThread>;
+    /// A PC asked for a conversation's messages before `before` (Unix ms;
+    /// the latest when null), newest first.
+    fn sms_messages(&self, thread: String, before: Option<i64>, limit: u32) -> Vec<SmsMessage>;
+    /// A PC asked to send a text (checked: 1-20 recipients, not empty).
+    /// False if it couldn't be sent.
+    fn sms_send(&self, to: Vec<String>, body: String) -> bool;
+    /// A PC asked to send a text or MMS with optional image attachments.
+    /// False if it couldn't be sent.
+    fn send_sms_with_attachments(
+        &self,
+        to: Vec<String>,
+        body: String,
+        attachments: Vec<SmsAttachment>,
+    ) -> bool;
+    /// A PC asked which SIMs this phone texts from (#474).
+    fn sms_sims(&self) -> Vec<CallSim>;
+    /// Like `send_sms_with_attachments`, on the SIM `sim` (an id from `sms_sims`).
+    fn sms_send_on(
+        &self,
+        to: Vec<String>,
+        body: String,
+        attachments: Vec<SmsAttachment>,
+        sim: String,
+    ) -> bool;
+    /// A PC asked for a message's attachment; null when it's gone.
+    fn sms_part(&self, id: String) -> Option<SmsPartData>;
+    /// A PC asked to change one of this phone's quick settings (`id`: `"dnd"`,
+    /// `"ringer"`, `"flashlight"`, `"volume"`, `"brightness"`, `"wifi"`,
+    /// `"bluetooth"`). False if the phone couldn't.
+    fn set_phone_toggle(&self, id: String, value: PhoneToggleValue) -> bool;
+    /// Unlock the PC with this phone (ADR 0009), enrolling: ask the owner
+    /// ("Let `pc_name` unlock with your fingerprint for `user_name`?"); after a
+    /// strong biometric, encrypt `key` with a Keystore key for `pc` and `user`
+    /// that needs a strong biometric for every use and is invalidated by a new
+    /// fingerprint. Return it encrypted (IV included). Blocks until answered
+    /// (the core gives up after 90 s).
+    fn unlock_wrap(
+        &self,
+        pc: String,
+        pc_name: String,
+        user_name: String,
+        user: String,
+        key: Vec<u8>,
+    ) -> Result<Vec<u8>, UnlockRefusal>;
+    /// Unlock the PC with this phone: show "Unlock `pc_name` for
+    /// `user_name`?"; after a strong biometric, decrypt `wrapped` with that
+    /// Keystore key and return the key. Blocks until answered (30 s).
+    fn unlock_unwrap(
+        &self,
+        pc: String,
+        pc_name: String,
+        user_name: String,
+        user: String,
+        wrapped: Vec<u8>,
+    ) -> Result<Vec<u8>, UnlockRefusal>;
+    /// Unlock the PC with this phone: delete the Keystore keys kept for `pc`
+    /// (for `user`, or all of them).
+    fn unlock_forget(&self, pc: String, user: Option<String>);
+    /// Enroll a biometric-bound Linux unlock key and return the uncompressed P-256 point.
+    fn linux_unlock_enroll(
+        &self,
+        pc: String,
+        pc_name: String,
+        user_name: String,
+        uid: u32,
+        timeout_ms: u64,
+        attempt: Arc<LinuxUnlockAttempt>,
+    ) -> Result<Vec<u8>, UnlockRefusal>;
+    /// Prompt using the confirmed enrollment, then return a DER ECDSA signature.
+    fn linux_unlock_sign(
+        &self,
+        pc: String,
+        uid: u32,
+        transcript: Vec<u8>,
+        attempt: Arc<LinuxUnlockAttempt>,
+    ) -> Result<Vec<u8>, UnlockRefusal>;
+    /// Forget one Linux account or all Linux unlock keys for this paired PC.
+    fn linux_unlock_forget(&self, pc: String, uid: Option<u32>);
+    /// A PC asked to list a folder in this phone's storage (`""` is root).
+    fn storage_list(&self, path: String) -> Result<Vec<StorageEntry>, StorageFailure>;
+    /// A PC asked to open a file in this phone's storage for ranged reading.
+    fn storage_open_read(&self, path: String) -> Result<StorageReadFile, StorageFailure>;
+    /// A PC finished uploading a file to `staged_path`: move/copy it into
+    /// `path` in this phone's storage.
+    fn storage_write(
+        &self,
+        path: String,
+        staged_path: String,
+        modified: Option<i64>,
+    ) -> Result<StorageWriteDone, StorageFailure>;
+    /// A PC asked to create a folder at `path` in this phone's storage.
+    fn storage_mkdir(&self, path: String) -> Result<(), StorageFailure>;
+    /// A PC asked to rename or move `from` to `to` in this phone's storage.
+    fn storage_rename(&self, from: String, to: String) -> Result<(), StorageFailure>;
+    /// A PC asked to delete `path` in this phone's storage (`confirmed`: the
+    /// PC user confirmed permanent deletion if trash isn't available).
+    fn storage_delete(&self, path: String, confirmed: bool) -> Result<(), StorageFailure>;
+}
+
+/// Encrypts the device key at rest (Android: a Keystore key).
+#[uniffi::export(with_foreign)]
+pub trait KeyProtector: Send + Sync {
+    fn protect(&self, plaintext: Vec<u8>) -> Result<Vec<u8>>;
+    fn unprotect(&self, ciphertext: Vec<u8>) -> Result<Vec<u8>>;
+}
+
+/// Receives core events on a core thread. Hand them off; don't block.
+#[uniffi::export(with_foreign)]
+pub trait EventListener: Send + Sync {
+    fn on_event(&self, event: Event);
+}
+
+struct FfiMirrorSink {
+    id: String,
+    listener: Arc<dyn EventListener>,
+}
+
+impl std::fmt::Debug for FfiMirrorSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FfiMirrorSink").field("id", &self.id).finish_non_exhaustive()
+    }
+}
+
+impl core::MirrorSink for FfiMirrorSink {
+    fn config(&self, config: core::MirrorConfig) {
+        self.listener.on_event(Event::PcMirrorConfig {
+            id: self.id.clone(),
+            codec: config.codec,
+            width: config.width,
+            height: config.height,
+        });
+    }
+
+    fn packet(&self, keyframe: bool, time_us: u64, data: Vec<u8>) {
+        self.listener.on_event(Event::PcMirrorFrame { id: self.id.clone(), keyframe, time_us, data });
+    }
+
+    fn ended(&self) {
+        self.listener.on_event(Event::PcMirrorEnded { id: self.id.clone() });
+    }
+}
+
+struct PlatformAdapter(Arc<dyn Platform>, Arc<dyn EventListener>);
+
+impl std::fmt::Debug for PlatformAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PlatformAdapter")
+    }
+}
+
+impl core::Platform for PlatformAdapter {
+    fn diag_facts(&self) -> Option<(core::diag::report::DeviceFacts, Vec<(String, String)>)> {
+        self.0.diag_facts().map(ReportDevice::split)
+    }
+    fn start_ringing(&self) {
+        self.0.start_ringing();
+    }
+    fn stop_ringing(&self) {
+        self.0.stop_ringing();
+    }
+    fn dismiss_notification(&self, key: &str) -> Result<(), core::NotificationError> {
+        Ok(self.0.dismiss_notification(key.to_owned())?)
+    }
+    fn run_notification_action(
+        &self,
+        key: &str,
+        action: &str,
+        reply: Option<&str>,
+    ) -> Result<(), core::NotificationError> {
+        Ok(self.0.run_notification_action(key.to_owned(), action.to_owned(), reply.map(str::to_owned))?)
+    }
+    fn set_clipboard(&self, text: &str) -> Result<(), String> {
+        if self.0.set_clipboard(text.to_owned()) { Ok(()) } else { Err("the clipboard rejected it".into()) }
+    }
+    fn set_clipboard_private(&self, text: &str) -> Result<(), String> {
+        if self.0.set_clipboard_private(text.to_owned()) {
+            Ok(())
+        } else {
+            Err("the phone couldn't set the clipboard".to_owned())
+        }
+    }
+    fn clear_clipboard_private(&self, text: &str) {
+        self.0.clear_clipboard_private(text.to_owned());
+    }
+    fn set_clipboard_rich(&self, text: &str, html: Option<&str>, rtf: Option<&str>) -> Result<(), String> {
+        if self.0.set_clipboard_rich(text.to_owned(), html.map(str::to_owned), rtf.map(str::to_owned)) {
+            Ok(())
+        } else {
+            Err("the clipboard rejected it".into())
+        }
+    }
+    fn media_command(
+        &self,
+        player: &str,
+        action: core::MediaAction,
+        position: Option<u64>,
+    ) -> Result<(), core::MediaError> {
+        Ok(self.0.media_command(player.to_owned(), action.into(), position)?)
+    }
+    fn adb_may_be_connected(&self) -> bool {
+        self.0.adb_may_be_connected()
+    }
+    fn open_link(&self, from: &DeviceId, url: &str) -> Result<(), String> {
+        if self.0.open_link(from.to_string(), url.to_owned()) { Ok(()) } else { Err("not shown".into()) }
+    }
+    fn watch_offered(
+        &self,
+        from: &DeviceId,
+        player: &str,
+        title: Option<&str>,
+        file: Option<&core::WatchFile>,
+    ) -> Result<(), String> {
+        let file =
+            file.map(|f| WatchFileOffer { name: f.name.clone(), size: f.size, position_ms: f.position });
+        if self.0.watch_offered(from.to_string(), player.to_owned(), title.map(str::to_owned), file) {
+            Ok(())
+        } else {
+            Err("not shown".into())
+        }
+    }
+    fn task_notify(&self, from: &DeviceId, task: &core::TaskNotify) -> Result<(), String> {
+        if self.0.task_notify(from.to_string(), task.clone().into()) {
+            Ok(())
+        } else {
+            Err("not shown".into())
+        }
+    }
+    fn set_clipboard_image(&self, mime: &str, bytes: &[u8]) -> Result<(), String> {
+        if self.0.set_clipboard_image(mime.to_owned(), bytes.to_vec()) {
+            Ok(())
+        } else {
+            Err("the clipboard rejected it".into())
+        }
+    }
+    fn app_uninstall_requested(&self, peer: &DeviceId, pkg: &str) -> Result<(), String> {
+        if self.0.app_uninstall_requested(peer.to_string(), pkg.to_owned()) {
+            Ok(())
+        } else {
+            Err("the phone couldn't uninstall it".into())
+        }
+    }
+    fn mirror_requested(&self, peer: &DeviceId, options: &core::MirrorStart) -> Result<(), String> {
+        let options = MirrorOptions {
+            max_size: options.max_size,
+            fps: options.fps,
+            bitrate: options.bitrate,
+            audio: options.audio,
+            session: options.session,
+            app: options.app.clone(),
+            stay_awake: options.stay_awake,
+            screen_off: options.screen_off,
+            sound_only: options.sound_only,
+        };
+        if self.0.mirror_requested(peer.to_string(), options) {
+            Ok(())
+        } else {
+            Err("the phone couldn't".into())
+        }
+    }
+    fn mirror_stop_requested(&self, peer: &DeviceId, session: u32) {
+        self.0.mirror_stop_requested(peer.to_string(), session);
+    }
+    fn mirror_keyframe_requested(&self, peer: &DeviceId, session: u32) {
+        self.0.mirror_keyframe_requested(peer.to_string(), session);
+    }
+    fn mirror_resize_requested(&self, peer: &DeviceId, session: u32, width: u32, height: u32, zoom: u32) {
+        self.0.mirror_resize_requested(peer.to_string(), session, width, height, zoom);
+    }
+    fn mirror_power_requested(&self, peer: &DeviceId, stay_awake: bool, screen_off: bool) {
+        self.0.mirror_power_requested(peer.to_string(), stay_awake, screen_off);
+    }
+    fn mirror_rotate_requested(&self, peer: &DeviceId, landscape: bool) {
+        self.0.mirror_rotate_requested(peer.to_string(), landscape);
+    }
+    fn mirror_sound_requested(&self, peer: &DeviceId, on: bool) {
+        self.0.mirror_sound_requested(peer.to_string(), on);
+    }
+    fn mirror_input(&self, peer: &DeviceId, session: u32, input: core::MirrorInput) {
+        self.0.mirror_input(peer.to_string(), session, input.into());
+    }
+    fn pointer_enter(
+        &self,
+        peer: &DeviceId,
+        edge: core::PointerEdge,
+        y: f32,
+    ) -> Result<core::PointerScreen, String> {
+        let edge = match edge {
+            core::PointerEdge::Left => "left",
+            core::PointerEdge::Right => "right",
+        };
+        let PointerScreen { width, height, scale } = self
+            .0
+            .pointer_enter(peer.to_string(), edge.to_owned(), y)
+            .ok_or_else(|| "the phone can't show a pointer".to_owned())?;
+        Ok(core::PointerScreen { width, height, scale })
+    }
+    fn pointer_move(&self, peer: &DeviceId, moved: core::PointerMove) {
+        self.0.pointer_move(peer.to_string(), moved.dx, moved.dy, moved.buttons, moved.wheel);
+    }
+    fn pointer_where(&self, peer: &DeviceId) -> Option<core::PointerAt> {
+        self.0.pointer_where(peer.to_string()).map(|PointerPosition { x, y }| core::PointerAt { x, y })
+    }
+    fn pointer_leave(&self, peer: &DeviceId) {
+        self.0.pointer_leave(peer.to_string());
+    }
+    fn webcam_requested(&self, peer: &DeviceId, options: &core::WebcamStart) -> Result<(), String> {
+        let options = WebcamOptions {
+            camera: options.camera.clone(),
+            width: options.width,
+            height: options.height,
+            fps: options.fps,
+            bitrate: options.bitrate,
+        };
+        if self.0.webcam_requested(peer.to_string(), options) {
+            Ok(())
+        } else {
+            Err("the phone couldn't".into())
+        }
+    }
+    fn webcam_stop_requested(&self, peer: &DeviceId) {
+        self.0.webcam_stop_requested(peer.to_string());
+    }
+    fn mic_requested(&self, peer: &DeviceId) -> Result<(), String> {
+        if self.0.mic_requested(peer.to_string()) { Ok(()) } else { Err("not asked".into()) }
+    }
+    fn mic_stop_requested(&self, peer: &DeviceId) {
+        self.0.mic_stop_requested(peer.to_string());
+    }
+    fn call_audio_requested(&self, peer: &DeviceId, call_id: &str) -> Result<(), String> {
+        if self.0.call_audio_requested(peer.to_string(), call_id.to_owned()) {
+            Ok(())
+        } else {
+            Err("the phone can't reach the call's sound".into())
+        }
+    }
+    fn call_audio_stop_requested(&self, peer: &DeviceId) {
+        self.0.call_audio_stop_requested(peer.to_string());
+    }
+    fn webcam_keyframe_requested(&self, peer: &DeviceId) {
+        self.0.webcam_keyframe_requested(peer.to_string());
+    }
+    fn camera_capture_requested(
+        &self,
+        peer: &DeviceId,
+        request: &core::CameraCaptureRequest,
+    ) -> Result<(), String> {
+        let mode = match request.mode {
+            core::CameraCaptureMode::Photo => "photo",
+            core::CameraCaptureMode::Scan => "scan",
+        };
+        if self.0.camera_capture_requested(peer.to_string(), request.request_id.clone(), mode.to_owned()) {
+            Ok(())
+        } else {
+            Err("camera capture unavailable".into())
+        }
+    }
+    fn camera_capture_cancelled(&self, peer: &DeviceId, request_id: &str) {
+        self.0.camera_capture_cancelled(peer.to_string(), request_id.to_owned());
+    }
+    fn phone_apps(&self) -> Result<Vec<core::PhoneApp>, String> {
+        Ok(self
+            .0
+            .phone_apps()
+            .into_iter()
+            .map(|a| core::PhoneApp { pkg: a.pkg, label: a.label, icon: a.icon })
+            .collect())
+    }
+    fn sms_threads(&self, limit: u32) -> Result<Vec<core::SmsThread>, String> {
+        Ok(self
+            .0
+            .sms_threads(limit)
+            .into_iter()
+            .map(|t| core::SmsThread {
+                id: t.id,
+                addresses: t.addresses,
+                names: t.names,
+                snippet: t.snippet,
+                date: t.date,
+                unread: t.unread,
+                photo: t.photo,
+            })
+            .collect())
+    }
+    fn sms_messages(
+        &self,
+        thread: &str,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<core::SmsMessage>, String> {
+        Ok(self
+            .0
+            .sms_messages(thread.to_owned(), before, limit)
+            .into_iter()
+            .map(|m| core::SmsMessage {
+                id: m.id,
+                thread: m.thread,
+                address: m.address,
+                body: m.body,
+                date: m.date,
+                outgoing: m.outgoing,
+                status: m.status,
+                parts: m
+                    .parts
+                    .into_iter()
+                    .map(|p| core::SmsPart { id: p.id, mime: p.mime, size: p.size })
+                    .collect(),
+                sim: m.sim,
+            })
+            .collect())
+    }
+    fn sms_send(&self, to: &[String], body: &str) -> Result<(), String> {
+        if self.0.sms_send(to.to_vec(), body.to_owned()) { Ok(()) } else { Err("not sent".into()) }
+    }
+    fn send_sms_with_attachments(
+        &self,
+        to: &[String],
+        body: &str,
+        attachments: &[core::SmsAttachment],
+    ) -> Result<(), String> {
+        if attachments.is_empty() {
+            return self.sms_send(to, body);
+        }
+        let att: Vec<SmsAttachment> =
+            attachments.iter().cloned().map(|a| SmsAttachment { mime: a.mime, data: a.data }).collect();
+        if self.0.send_sms_with_attachments(to.to_vec(), body.to_owned(), att) {
+            Ok(())
+        } else {
+            Err("not sent".into())
+        }
+    }
+    fn sms_sims(&self) -> Result<core::CallSims, String> {
+        let sims = self.0.sms_sims();
+        let default = sims.iter().find(|s| s.is_default).map(|s| s.id.clone());
+        Ok(core::CallSims {
+            sims: sims.into_iter().map(|s| core::CallSim { id: s.id, label: s.label }).collect(),
+            default,
+        })
+    }
+    fn send_sms_on(
+        &self,
+        to: &[String],
+        body: &str,
+        attachments: &[core::SmsAttachment],
+        sim: &str,
+    ) -> Result<(), String> {
+        let att: Vec<SmsAttachment> =
+            attachments.iter().cloned().map(|a| SmsAttachment { mime: a.mime, data: a.data }).collect();
+        if self.0.sms_send_on(to.to_vec(), body.to_owned(), att, sim.to_owned()) {
+            Ok(())
+        } else {
+            Err("not sent".into())
+        }
+    }
+    fn sms_part(&self, id: &str) -> Result<(String, Vec<u8>), String> {
+        let part = self.0.sms_part(id.to_owned()).ok_or("it's gone")?;
+        Ok((part.mime, part.data))
+    }
+    fn call_command(&self, id: &str, command: core::CallCommand) -> Result<(), String> {
+        let command = match command {
+            core::CallCommand::Answer => CallCommand::Answer,
+            core::CallCommand::Decline => CallCommand::Decline,
+            core::CallCommand::Silence => CallCommand::Silence,
+            core::CallCommand::Mute(on) => CallCommand::Mute { on },
+            core::CallCommand::Speaker(on) => CallCommand::Speaker { on },
+            core::CallCommand::Hold(on) => CallCommand::Hold { on },
+            core::CallCommand::Dtmf(digit) => CallCommand::Dtmf { digit: digit.to_string() },
+            core::CallCommand::Volume(up) => CallCommand::Volume { up },
+        };
+        if self.0.call_command(id.to_owned(), command) { Ok(()) } else { Err("the phone couldn't".into()) }
+    }
+    fn call_log(&self, before: Option<i64>, limit: u32) -> Result<Vec<core::CallLogEntry>, String> {
+        Ok(self
+            .0
+            .call_log(before, limit)
+            .into_iter()
+            .map(|e| core::CallLogEntry {
+                id: e.id,
+                number: e.number,
+                name: e.name,
+                direction: e.direction,
+                date: e.date,
+                duration: e.duration,
+                photo: e.photo,
+            })
+            .collect())
+    }
+    fn call_dial(&self, number: &str) -> Result<(), String> {
+        if self.0.call_dial(number.to_owned()) { Ok(()) } else { Err("the phone couldn't".into()) }
+    }
+    fn call_sims(&self) -> Result<core::CallSims, String> {
+        let sims = self.0.call_sims();
+        let default = sims.iter().find(|s| s.is_default).map(|s| s.id.clone());
+        Ok(core::CallSims {
+            sims: sims.into_iter().map(|s| core::CallSim { id: s.id, label: s.label }).collect(),
+            default,
+        })
+    }
+    fn call_dial_on(&self, number: &str, sim: &str) -> Result<(), String> {
+        if self.0.call_dial_on(number.to_owned(), sim.to_owned()) {
+            Ok(())
+        } else {
+            Err("the phone couldn't".into())
+        }
+    }
+    fn contacts(&self, query: Option<&str>, offset: u32, limit: u32) -> Result<Vec<core::Contact>, String> {
+        Ok(self
+            .0
+            .contacts(query.map(str::to_owned), offset, limit)
+            .into_iter()
+            .map(|c| core::Contact {
+                id: c.id,
+                name: c.name,
+                numbers: c
+                    .numbers
+                    .into_iter()
+                    .map(|n| core::ContactNumber { number: n.number, label: n.label })
+                    .collect(),
+                starred: c.starred,
+                photo: c.photo,
+            })
+            .collect())
+    }
+    fn open_photo(&self, id: &str) -> Result<core::OutgoingFile, String> {
+        let file = self.0.open_photo(id.to_owned()).ok_or("it's gone")?;
+        file_to_send(file).map_err(|e| e.to_string())
+    }
+    fn photo_albums(&self) -> Result<Vec<core::PhotoAlbum>, String> {
+        Ok(self
+            .0
+            .photo_albums()
+            .into_iter()
+            .map(|a| core::PhotoAlbum { id: a.id, name: a.name, count: a.count, cover: a.cover })
+            .collect())
+    }
+    fn photo_list(
+        &self,
+        album: Option<&str>,
+        before: Option<(i64, &str)>,
+        limit: u32,
+    ) -> Result<Vec<core::PhotoItem>, String> {
+        let (date, id) = before.map_or((None, String::new()), |(date, id)| (Some(date), id.to_owned()));
+        Ok(self
+            .0
+            .photo_list(album.map(str::to_owned), date, id, limit)
+            .into_iter()
+            .map(|i| core::PhotoItem {
+                id: i.id,
+                name: i.name,
+                date: i.date,
+                size: i.size,
+                width: i.width,
+                height: i.height,
+                duration: i.duration,
+                album: i.album,
+            })
+            .collect())
+    }
+    fn photo_delete(&self, ids: &[String]) -> Result<u32, String> {
+        Ok(self.0.photo_delete(ids.to_vec()))
+    }
+    fn photo_thumbs(&self, ids: &[String]) -> Result<Vec<core::PhotoThumb>, String> {
+        Ok(self
+            .0
+            .photo_thumbs(ids.to_vec())
+            .into_iter()
+            .map(|t| core::PhotoThumb { id: t.id, data: t.data })
+            .collect())
+    }
+    fn unlock_wrap(
+        &self,
+        pc: &core::DeviceId,
+        ask: &core::unlock::Ask,
+        key: &[u8],
+    ) -> Result<Vec<u8>, core::unlock::KeyRefusal> {
+        Ok(self.0.unlock_wrap(
+            pc.to_string(),
+            ask.pc_name.clone(),
+            ask.user_name.clone(),
+            ask.user.clone(),
+            key.to_vec(),
+        )?)
+    }
+    fn unlock_unwrap(
+        &self,
+        pc: &core::DeviceId,
+        ask: &core::unlock::Ask,
+        wrapped: &[u8],
+    ) -> Result<Vec<u8>, core::unlock::KeyRefusal> {
+        Ok(self.0.unlock_unwrap(
+            pc.to_string(),
+            ask.pc_name.clone(),
+            ask.user_name.clone(),
+            ask.user.clone(),
+            wrapped.to_vec(),
+        )?)
+    }
+    fn unlock_forget(&self, pc: &core::DeviceId, user: Option<&str>) {
+        self.0.unlock_forget(pc.to_string(), user.map(str::to_owned));
+    }
+    fn linux_unlock_enroll(
+        &self,
+        pc: &core::DeviceId,
+        ask: &core::linux_unlock::Ask,
+        attempt: &core::linux_unlock::Attempt,
+    ) -> Result<Vec<u8>, core::unlock::KeyRefusal> {
+        let timeout_ms = u64::try_from(ask.timeout.as_millis()).unwrap_or(u64::MAX);
+        Ok(self.0.linux_unlock_enroll(
+            pc.to_string(),
+            ask.pc_name.clone(),
+            ask.user_name.clone(),
+            ask.uid,
+            timeout_ms,
+            Arc::new(LinuxUnlockAttempt(attempt.clone())),
+        )?)
+    }
+    fn linux_unlock_sign(
+        &self,
+        pc: &core::DeviceId,
+        uid: u32,
+        transcript: &[u8],
+        attempt: &core::linux_unlock::Attempt,
+    ) -> Result<Vec<u8>, core::unlock::KeyRefusal> {
+        Ok(self.0.linux_unlock_sign(
+            pc.to_string(),
+            uid,
+            transcript.to_vec(),
+            Arc::new(LinuxUnlockAttempt(attempt.clone())),
+        )?)
+    }
+    fn linux_unlock_forget(&self, pc: &core::DeviceId, uid: Option<u32>) {
+        self.0.linux_unlock_forget(pc.to_string(), uid);
+    }
+    fn set_phone_toggle(&self, id: &str, value: &core::PhoneToggleValue) -> Result<(), String> {
+        let value = match value {
+            core::PhoneToggleValue::Bool(on) => PhoneToggleValue::Bool { on: *on },
+            core::PhoneToggleValue::Level(level) => PhoneToggleValue::Level { level: *level },
+            core::PhoneToggleValue::Mode(mode) => PhoneToggleValue::Mode { mode: mode.clone() },
+        };
+        if self.0.set_phone_toggle(id.to_owned(), value) { Ok(()) } else { Err("the phone couldn't".into()) }
+    }
+    fn storage_list(&self, path: &str) -> Result<Vec<core::StorageEntry>, core::StorageError> {
+        let items = self.0.storage_list(path.to_owned())?;
+        Ok(items
+            .into_iter()
+            .map(|e| core::StorageEntry {
+                name: e.name,
+                size: e.size,
+                modified: e.modified,
+                is_dir: e.is_dir,
+            })
+            .collect())
+    }
+    fn storage_open_read(&self, path: &str) -> Result<core::StorageReadFile, core::StorageError> {
+        let file = self.0.storage_open_read(path.to_owned())?;
+        let outgoing = file_to_send(file.source).map_err(|e| core::StorageError::Failed(e.to_string()))?;
+        Ok(core::StorageReadFile { source: outgoing.source, size: file.size, modified: file.modified })
+    }
+    fn storage_write(
+        &self,
+        path: &str,
+        staged: &std::path::Path,
+        modified: Option<i64>,
+    ) -> Result<core::StorageWriteDone, core::StorageError> {
+        let staged_str = staged.to_string_lossy().into_owned();
+        let done = self.0.storage_write(path.to_owned(), staged_str, modified)?;
+        Ok(core::StorageWriteDone { size: done.size, modified: done.modified })
+    }
+    fn storage_mkdir(&self, path: &str) -> Result<(), core::StorageError> {
+        Ok(self.0.storage_mkdir(path.to_owned())?)
+    }
+    fn storage_rename(&self, from: &str, to: &str) -> Result<(), core::StorageError> {
+        Ok(self.0.storage_rename(from.to_owned(), to.to_owned())?)
+    }
+    fn storage_delete(&self, path: &str, confirmed: bool) -> Result<(), core::StorageError> {
+        Ok(self.0.storage_delete(path.to_owned(), confirmed)?)
+    }
+    fn mirror_sink(&self, peer: &DeviceId, session: u32) -> Option<Arc<dyn core::MirrorSink>> {
+        if session != core::MIRROR_SCREEN {
+            return None;
+        }
+        Some(Arc::new(FfiMirrorSink { id: peer.to_string(), listener: self.1.clone() }))
+    }
+}
+
+struct KeyProtectorAdapter(Arc<dyn KeyProtector>);
+
+/// Key files written with the Android Keystore protector.
+const ANDROID_KEYSTORE_PROTECTOR: u8 = 2;
+
+impl core::KeyProtector for KeyProtectorAdapter {
+    fn id(&self) -> u8 {
+        ANDROID_KEYSTORE_PROTECTOR
+    }
+    fn protect(&self, plaintext: &[u8]) -> std::io::Result<Vec<u8>> {
+        self.0.protect(plaintext.to_vec()).map_err(std::io::Error::other)
+    }
+    fn unprotect(&self, ciphertext: &[u8]) -> std::io::Result<Vec<u8>> {
+        self.0.unprotect(ciphertext.to_vec()).map_err(std::io::Error::other)
+    }
+}
+
+// ---- The node ----
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NodeOptions {
+    /// App-private directory for the identity and database.
+    pub data_dir: String,
+    pub device: DeviceInfo,
+    pub app_version: String,
+    pub power: PowerLevel,
+    /// Allow connections through relays when away from home.
+    pub away_mode: bool,
+    /// Where received files are put once complete (the app then moves them
+    /// where the user finds them).
+    pub downloads_dir: String,
+    /// Loopback TCP port (`127.0.0.1:<port>`) for the USB tunnel on Android.
+    #[uniffi(default = Some(53319))]
+    pub usb_port: Option<u16>,
+}
+
+#[derive(Debug, uniffi::Enum)]
+pub enum RelayRegion {
+    NorthAmericaEast,
+    NorthAmericaWest,
+    Europe,
+    AsiaPacific,
+    Custom,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct RelayServer {
+    pub url: String,
+    pub provider: String,
+    pub region: RelayRegion,
+    pub enabled: bool,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct HomeRelay {
+    pub url: String,
+    pub connected: bool,
+    pub failed: bool,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct RelayRoute {
+    pub device: String,
+    pub url: String,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct RelaySnapshot {
+    pub servers: Vec<RelayServer>,
+    pub home: Vec<HomeRelay>,
+    pub routes: Vec<RelayRoute>,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct RelayProbe {
+    pub url: String,
+    pub rtt_ms: Option<u32>,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, uniffi::Enum)]
+pub enum RelayEdit {
+    Add,
+    Enable,
+    Disable,
+    Remove,
+}
+
+#[derive(Debug, uniffi::Enum)]
+pub enum RelayEditResult {
+    Saved,
+    InvalidAddress,
+    Duplicate,
+    Limit,
+    Failed,
+}
+
+/// Cancellation of a single Linux unlock or enrollment on the phone.
+#[derive(Debug, uniffi::Object)]
+pub struct LinuxUnlockAttempt(core::linux_unlock::Attempt);
+
+#[uniffi::export]
+impl LinuxUnlockAttempt {
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
+    pub async fn wait_cancelled(&self) {
+        self.0.cancelled().await;
+    }
+}
+
+/// The NectarLink engine. One per app process.
+#[derive(uniffi::Object)]
+pub struct NectarlinkNode {
+    runtime: Runtime,
+    node: Node,
+}
+
+impl std::fmt::Debug for NectarlinkNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NectarlinkNode").field("node", &self.node).finish_non_exhaustive()
+    }
+}
+
+impl NectarlinkNode {
+    /// Runs `fut` on the node's runtime and waits for it from the caller's
+    /// executor.
+    async fn run<T: Send + 'static>(&self, fut: impl Future<Output = T> + Send + 'static) -> T {
+        match self.runtime.spawn(fut).await {
+            Ok(value) => value,
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
+    }
+
+    /// Runs `fut` on the node's runtime and blocks the calling thread until it finishes.
+    fn block_on_rt<T: Send + 'static>(&self, fut: impl Future<Output = T> + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.runtime.spawn(async move {
+            let _ = tx.send(fut.await);
+        });
+        rx.recv().expect("nectarlink-core runtime task panicked")
+    }
+}
+
+#[uniffi::export]
+impl NectarlinkNode {
+    /// Loads or creates this device's identity and trust store, starts
+    /// networking and starts delivering events to `listener`. Blocks for
+    /// the (short) startup; call it off the main thread.
+    #[uniffi::constructor]
+    pub fn start(
+        options: NodeOptions,
+        platform: Arc<dyn Platform>,
+        key_protector: Arc<dyn KeyProtector>,
+        listener: Arc<dyn EventListener>,
+    ) -> Result<Arc<Self>> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("nectarlink-core")
+            .enable_all()
+            .build()
+            .map_err(|e| NectarlinkError::Internal { reason: e.to_string() })?;
+        let mut config =
+            NodeConfig::new(PathBuf::from(options.data_dir), options.device.into(), options.app_version);
+        config.power = options.power.into();
+        config.away_mode = options.away_mode;
+        config.downloads_dir = Some(PathBuf::from(options.downloads_dir));
+        config.usb_port = options.usb_port;
+        config.key_protector = Some(Arc::new(KeyProtectorAdapter(key_protector)));
+        if !config.capabilities.iter().any(|c| c == core::MIRROR_VIEW) {
+            config.capabilities.push(core::MIRROR_VIEW.into());
+        }
+        let node =
+            runtime.block_on(Node::start(config, Arc::new(PlatformAdapter(platform, listener.clone()))))?;
+
+        let mut events = node.events();
+        let node_for_events = node.clone();
+        runtime.spawn(async move {
+            // An exception thrown by the app's listener comes back as a panic here. One
+            // bad event must not end this task, or no event would reach the app again.
+            let deliver = |event: Event| {
+                let delivered =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener.on_event(event)));
+                if delivered.is_err() {
+                    tracing::error!("the app's event listener failed on an event; carrying on");
+                }
+            };
+            // What the app was given, so after a lag it gets only what it missed.
+            let mut given = core::Resync::new();
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        given.note(&event);
+                        if let Some(ev) = Event::from_node(event) {
+                            deliver(ev);
+                        }
+                    }
+                    Err(RecvError::Lagged(missed)) => {
+                        tracing::warn!(missed, "event listener fell behind; resynchronizing state");
+                        let devices = node_for_events.paired_devices().unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "can't read paired devices to resynchronize");
+                            Vec::new()
+                        });
+                        for d in devices {
+                            deliver(Event::LinkChanged { id: d.id.to_string(), link: d.link.into() });
+                            deliver(Event::WakeInfoChanged { id: d.id.to_string(), can_wake: d.can_wake });
+                            deliver(Event::ReconnectChanged { id: d.id.to_string(), on: d.reconnect });
+                            deliver(Event::PeerInfoChanged { id: d.id.to_string(), info: d.info.into() });
+                            if let Ok(matrix) = node_for_events.capabilities(d.id) {
+                                deliver(Event::Capabilities {
+                                    id: d.id.to_string(),
+                                    features: features(&matrix),
+                                });
+                            }
+                        }
+                        deliver(Event::QueueChanged);
+                        // Transfers, rings and pairing only ever come as events.
+                        for event in given.missed(node_for_events.latest_state()) {
+                            if let Some(ev) = Event::from_node(event) {
+                                deliver(ev);
+                            }
+                        }
+                    }
+                    Err(RecvError::Closed) => return,
+                }
+            }
+        });
+        Ok(Arc::new(NectarlinkNode { runtime, node }))
+    }
+
+    /// This device's ID (z-base-32).
+    pub fn device_id(&self) -> String {
+        self.node.device_id().to_string()
+    }
+
+    /// Stops networking and tells connected devices.
+    pub async fn shutdown(&self) {
+        let node = self.node.clone();
+        self.run(async move {
+            if tokio::time::timeout(SHUTDOWN_TIMEOUT, node.shutdown()).await.is_err() {
+                tracing::warn!("shutdown timed out");
+            }
+        })
+        .await;
+    }
+
+    // ---- Pairing ----
+
+    /// Enters pairing mode and returns the link to show as a QR code.
+    pub async fn pairing_start_qr(&self) -> Result<String> {
+        let node = self.node.clone();
+        self.run(async move { Ok(node.pairing_start_qr().await?.to_uri()) }).await
+    }
+
+    /// Pairs with the device whose pairing link was scanned.
+    pub async fn pairing_join(&self, link: String) -> Result<()> {
+        let node = self.node.clone();
+        self.run(async move { Ok(node.pairing_join(&link).await?) }).await
+    }
+
+    /// Starts nearby pairing with a discovered device in pairing mode; the
+    /// code to compare arrives as `Event::PairingCode`.
+    pub async fn pairing_start_nearby(&self, peer: String) -> Result<()> {
+        let peer = parse_id(&peer)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.pairing_start_nearby(peer).await?) }).await
+    }
+
+    /// Answers the code comparison.
+    pub fn pairing_confirm(&self, codes_match: bool) -> Result<()> {
+        Ok(self.node.pairing_confirm(codes_match)?)
+    }
+
+    pub fn pairing_cancel(&self) {
+        self.node.pairing_cancel();
+    }
+
+    /// Whether a list of nearby devices (pairing) is on screen: the LAN is
+    /// then asked who's there often, and rarely otherwise, to save battery.
+    pub fn set_discovery_fast(&self, fast: bool) {
+        self.node.set_discovery_fast(fast);
+    }
+
+    pub fn discovered_devices(&self) -> Vec<DiscoveredDevice> {
+        self.node.discovered_devices().into_iter().map(Into::into).collect()
+    }
+
+    // ---- Paired devices ----
+
+    pub fn paired_devices(&self) -> Result<Vec<PairedDevice>> {
+        Ok(self.node.paired_devices()?.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn unpair(&self, id: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.unpair(id).await?) }).await
+    }
+
+    /// Asks a PC this phone is plugged into over USB to start this phone's
+    /// Elevated helper (`docs/protocol/elevated-usb.md`); returns its port.
+    pub async fn elevated_usb_start(
+        &self,
+        pc_id: String,
+        apk: String,
+        token: String,
+        grants: Vec<String>,
+    ) -> Result<u16> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.elevated_usb_start(id, apk, token, grants).await?) }).await
+    }
+
+    /// Asks paired device `id` for its part of the problem report being
+    /// made; with `log`, its user is asked to share its recent log too
+    /// (a `ReportLogArrived` event follows). `report_prepare` includes what
+    /// came back.
+    pub async fn report_ask(&self, id: String, log: bool, just_now: bool) -> ReportPeer {
+        let Ok(peer) = parse_id(&id) else { return ReportPeer::Offline };
+        let node = self.node.clone();
+        let asked = self.run(async move { Ok(node.diag_ask(peer, log, just_now).await?) }).await;
+        match asked {
+            Ok(part) => {
+                let state = match part.log {
+                    core::PeerLog::Asking => ReportPeer::Asking,
+                    core::PeerLog::Busy => ReportPeer::Busy,
+                    core::PeerLog::NotAsked => ReportPeer::Included,
+                };
+                peer_parts().insert(peer, part);
+                state
+            }
+            Err(NectarlinkError::Unsupported) => ReportPeer::Unsupported,
+            Err(_) => ReportPeer::Offline,
+        }
+    }
+
+    /// This phone's user answered `id`'s request for its log.
+    pub async fn report_log_answer(&self, id: String, share: bool) -> Result<()> {
+        let peer = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.diag_log_answer(peer, share).await?) }).await
+    }
+
+    /// Whether `id` still waits for this phone's user to answer its request
+    /// for the log.
+    pub fn report_log_waiting(&self, id: String) -> bool {
+        parse_id(&id).is_ok_and(|peer| self.node.diag_log_waiting(&peer))
+    }
+
+    pub async fn ring(&self, id: String, on: bool) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.ring(id, on).await?) }).await
+    }
+
+    pub async fn stop_ringing(&self) -> Result<()> {
+        let node = self.node.clone();
+        self.run(async move {
+            node.stop_ringing().await;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Dismisses a paired phone's or tablet's notification there, after it
+    /// was dismissed here (`notify.dismiss`).
+    pub async fn dismiss_peer_notification(&self, id: String, key: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.dismiss_notification(id, key).await?) }).await
+    }
+
+    pub fn capabilities(&self, id: String) -> Result<Vec<Feature>> {
+        Ok(features(&self.node.capabilities(parse_id(&id)?)?))
+    }
+
+    pub fn device_toggles(&self, id: String) -> Result<Vec<DeviceToggle>> {
+        Ok(self
+            .node
+            .device_toggles(parse_id(&id)?)?
+            .into_iter()
+            .map(|(name, enabled)| DeviceToggle { name: name.into(), enabled })
+            .collect())
+    }
+
+    pub fn set_device_toggle(&self, id: String, name: String, enabled: bool) -> Result<()> {
+        Ok(self.node.set_device_toggle(parse_id(&id)?, &name, enabled)?)
+    }
+
+    /// Turns reconnecting to a paired device by itself off ("Stop
+    /// reconnecting": disconnects and stays disconnected, still paired) or
+    /// back on (dials it right away). Kept across restarts.
+    pub fn set_reconnect(&self, id: String, on: bool) -> Result<()> {
+        Ok(self.node.set_reconnect(parse_id(&id)?, on)?)
+    }
+
+    // ---- Files ----
+
+    /// Sends files to a paired PC; returns the transfer's ID. Progress
+    /// arrives as `Event::Transfer`.
+    pub async fn send_files(&self, id: String, files: Vec<FileToSend>) -> Result<String> {
+        let files = files_to_send(files)?;
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.send_files(id, files).await?) }).await
+    }
+
+    /// Hands off a document to a paired PC and asks the PC to open it with the
+    /// default application once it arrives (`docs/protocol/files.md`).
+    pub async fn send_handoff_files(&self, id: String, files: Vec<FileToSend>) -> Result<String> {
+        let files = files_to_send(files)?;
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.send_handoff_files(id, files).await?) }).await
+    }
+
+    /// Sends a voice recording and its markers to a paired PC; returns the
+    /// transfer's ID. Progress arrives as `Event::Transfer`.
+    pub async fn send_recording(
+        &self,
+        id: String,
+        file: FileToSend,
+        markers: Vec<RecordingMarker>,
+    ) -> Result<String> {
+        let file = file_to_send(file)?;
+        let id = parse_id(&id)?;
+        let markers = markers.into_iter().map(Into::into).collect();
+        let node = self.node.clone();
+        self.run(async move { Ok(node.send_recording(id, file, markers).await?) }).await
+    }
+
+    /// Accepts an incoming transfer waiting for user confirmation (LocalSend).
+    pub fn accept_transfer(&self, transfer_id: String) {
+        self.node.accept_transfer(&transfer_id);
+    }
+
+    /// Pauses an active transfer in either direction, preserving partial files on the receiver.
+    pub fn pause_transfer(&self, transfer_id: String) {
+        self.node.pause_transfer(&transfer_id);
+    }
+
+    /// Resumes a manually paused transfer in either direction.
+    pub fn resume_transfer(&self, transfer_id: String) {
+        self.node.resume_transfer(&transfer_id);
+    }
+
+    /// Cancels a transfer in either direction (or declines a pending incoming
+    /// LocalSend transfer).
+    pub fn cancel_transfer(&self, transfer_id: String) {
+        self.node.cancel_transfer(&transfer_id);
+    }
+
+    // ---- Persistent outgoing send queue ----
+
+    /// Lists items in the persistent outgoing send queue (ordered by `seq ASC`),
+    /// optionally filtered to a single paired `peer_id`.
+    pub fn send_queue(&self, peer_id: Option<String>) -> Result<Vec<FfiQueueItem>> {
+        let peer = match peer_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => Some(parse_id(id)?),
+            None => None,
+        };
+        Ok(self.node.send_queue(peer)?.into_iter().map(Into::into).collect())
+    }
+
+    /// Returns the ID of the most recently queued active (`Waiting` or `Sending`) item for `peer_id`.
+    pub fn latest_queued_id_for_peer(&self, peer_id: String) -> Option<String> {
+        let peer = parse_id(peer_id.trim()).ok()?;
+        self.node.latest_queued_id_for_peer(peer)
+    }
+
+    /// Cancels and removes a single item from the outgoing send queue (and cancels
+    /// its active file transfer and cleans up staged files if applicable).
+    pub fn cancel_queue_item(&self, id: String) -> Result<bool> {
+        Ok(self.node.cancel_queue_item(&id)?)
+    }
+
+    /// Cancels and removes all active (`Waiting` and `Sending`) items in the outgoing
+    /// send queue (optionally filtered to `peer_id`), returning the number of items cancelled.
+    pub fn cancel_all_queue_items(&self, peer_id: Option<String>) -> Result<u32> {
+        let peer = match peer_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => Some(parse_id(id)?),
+            None => None,
+        };
+        Ok(self.node.cancel_all_queue_items(peer)?)
+    }
+
+    /// Resets a failed or expired queue item back to `Waiting` so it retries immediately.
+    pub fn retry_queue_item(&self, id: String) -> Result<bool> {
+        Ok(self.node.retry_queue_item(&id)?)
+    }
+
+    /// Resets all failed or expired queue items (optionally filtered to `peer_id`)
+    /// back to `Waiting` and returns the number of items reset.
+    pub fn retry_all_failed_queue_items(&self, peer_id: Option<String>) -> Result<u32> {
+        let peer = match peer_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => Some(parse_id(id)?),
+            None => None,
+        };
+        Ok(self.node.retry_all_failed_queue_items(peer)?)
+    }
+
+    /// Removes all failed and expired items from the outgoing send queue
+    /// (optionally filtered to `peer_id`), cleans up their staged files, and returns
+    /// the number of items removed.
+    pub fn clear_finished_queue_items(&self, peer_id: Option<String>) -> Result<u32> {
+        let peer = match peer_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => Some(parse_id(id)?),
+            None => None,
+        };
+        Ok(self.node.clear_finished_queue_items(peer)?)
+    }
+
+    /// Marks any `Waiting` queue items whose TTL has elapsed as `Expired` and
+    /// returns the number of items expired.
+    pub fn expire_stale_queue_items(&self) -> Result<u32> {
+        Ok(self.node.expire_stale_queue_items()?)
+    }
+
+    // ---- LocalSend compatibility ----
+
+    /// Whether LocalSend v2.1 compatibility is enabled on this phone.
+    pub fn localsend_enabled(&self) -> bool {
+        self.node.localsend_enabled()
+    }
+
+    /// Turns LocalSend v2.1 compatibility on or off (persisted encrypted on disk).
+    pub fn set_localsend_enabled(&self, enabled: bool) -> Result<()> {
+        Ok(self.node.set_localsend_enabled(enabled)?)
+    }
+
+    /// Whether this phone's LocalSend server is actively bound and receiving.
+    pub fn localsend_receiving(&self) -> bool {
+        self.node.localsend_receiving()
+    }
+
+    /// Returns the LocalSend peers currently discovered on the local network.
+    pub fn localsend_peers(&self) -> Vec<LocalSendPeer> {
+        self.node.localsend_peers().into_iter().map(Into::into).collect()
+    }
+
+    /// Broadcasts a fresh LocalSend UDP multicast announcement.
+    pub fn refresh_localsend(&self) {
+        self.node.refresh_localsend();
+    }
+
+    /// Probes `host:port` via the LocalSend v2.1 HTTP/HTTPS API and adds the peer if found.
+    pub async fn probe_localsend_peer(&self, host: String, port: u16) -> Result<LocalSendPeer> {
+        let node = self.node.clone();
+        self.run(async move { Ok(node.probe_localsend_peer(&host, port).await?.into()) }).await
+    }
+
+    // ---- Clipboard ----
+
+    /// Puts text on a paired PC's clipboard.
+    pub async fn send_clipboard(&self, id: String, text: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.send_clipboard(id, text).await?) }).await
+    }
+
+    /// Puts text (and optional HTML and RTF rich text) on a paired PC's
+    /// clipboard.
+    pub async fn send_clipboard_rich(
+        &self,
+        id: String,
+        text: String,
+        html: Option<String>,
+        rtf: Option<String>,
+    ) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.send_clipboard_rich(id, text, html, rtf).await?) }).await
+    }
+
+    /// Puts a password or the like on a connected PC's clipboard: never recorded
+    /// or queued.
+    pub async fn send_clipboard_private(&self, id: String, text: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.send_clipboard_private(id, text).await?) }).await
+    }
+
+    /// Puts an image (`image/png` or `image/jpeg`) on a paired PC's
+    /// clipboard.
+    pub async fn send_clipboard_image(&self, id: String, mime: String, bytes: Vec<u8>) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.send_clipboard_image(id, mime, bytes).await?) }).await
+    }
+
+    /// Sends an automatic image to a connected PC without queueing.
+    pub async fn send_clipboard_image_live(&self, id: String, mime: String, bytes: Vec<u8>) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.send_clipboard_image_live(id, mime, bytes).await?) }).await
+    }
+
+    /// Whether the local clipboard history is enabled.
+    pub fn clipboard_history_enabled(&self) -> bool {
+        self.node.clipboard_history_enabled()
+    }
+
+    /// Turns the local clipboard history on or off.
+    pub fn set_clipboard_history_enabled(&self, enabled: bool) -> Result<()> {
+        Ok(self.node.set_clipboard_history_enabled(enabled)?)
+    }
+
+    /// Lists the local clipboard history (pinned first, then newest first),
+    /// optionally filtered by `query`.
+    pub fn clipboard_history(&self, query: Option<String>) -> Vec<ClipboardHistoryEntry> {
+        self.node.clipboard_history(query.as_deref()).into_iter().map(Into::into).collect()
+    }
+
+    /// Decrypts and returns the image bytes for an image entry in the
+    /// clipboard history, or `None` if not found.
+    pub fn clipboard_history_image(&self, id: String) -> Option<Vec<u8>> {
+        self.node.clipboard_history_image(&id).map(|(_, bytes)| bytes)
+    }
+
+    /// Pins or unpins an entry in the clipboard history.
+    pub fn pin_clipboard_history(&self, id: String, pinned: bool) -> bool {
+        self.node.pin_clipboard_history(&id, pinned)
+    }
+
+    /// Deletes one entry from the clipboard history.
+    pub fn delete_clipboard_history(&self, id: String) -> bool {
+        self.node.delete_clipboard_history(&id)
+    }
+
+    /// Clears the entire clipboard history and deletes its encrypted files from disk.
+    pub fn clear_clipboard_history(&self) -> Result<()> {
+        Ok(self.node.clear_clipboard_history()?)
+    }
+
+    /// Copies a clipboard history entry back onto this device's OS clipboard.
+    pub fn copy_clipboard_history(&self, id: String) -> Result<()> {
+        Ok(self.node.copy_clipboard_history(&id)?)
+    }
+
+    /// Sends a clipboard history entry (text or image) again to a paired device.
+    pub async fn resend_clipboard_history(&self, clip_id: String, device_id: String) -> Result<()> {
+        let peer = parse_id(&device_id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.resend_clipboard_history(peer, &clip_id).await?) }).await
+    }
+
+    // ---- Timeline ----
+
+    /// Returns the local timeline's retention policy.
+    pub fn timeline_retention(&self) -> Result<TimelineRetention> {
+        Ok(self.node.timeline_retention()?.into())
+    }
+
+    /// Updates the local timeline's retention policy and runs an immediate purge.
+    pub fn set_timeline_retention(&self, max_days: u32, max_entries: u32) -> Result<()> {
+        Ok(self.node.set_timeline_retention(core::TimelineRetention { max_days, max_entries })?)
+    }
+
+    /// Queries a page of the local cross-device timeline (newest first).
+    pub fn timeline_page(
+        &self,
+        kind: Option<TimelineKind>,
+        device_id: Option<String>,
+        search: Option<String>,
+        offset: u32,
+        limit: u32,
+    ) -> Result<TimelinePage> {
+        let device = match device_id {
+            Some(ref id) if !id.is_empty() => Some(parse_id(id)?),
+            _ => None,
+        };
+        Ok(self
+            .node
+            .timeline_page(&core::TimelineQuery {
+                kind: kind.map(Into::into),
+                device,
+                search,
+                offset,
+                limit,
+            })?
+            .into())
+    }
+
+    /// Deletes one timeline entry by row ID.
+    pub fn delete_timeline_entry(&self, id: i64) -> Result<bool> {
+        Ok(self.node.delete_timeline_entry(id)?)
+    }
+
+    /// Clears all timeline entries.
+    pub fn clear_timeline(&self) -> Result<()> {
+        let _ = self.node.clear_timeline()?;
+        Ok(())
+    }
+
+    /// Updates a timeline entry matching `ref_id` (e.g. after publishing an
+    /// incoming transfer to `MediaStore`).
+    pub fn update_timeline_by_ref(
+        &self,
+        ref_id: String,
+        kind: TimelineKind,
+        title: String,
+        detail: String,
+        target: String,
+        size_bytes: u64,
+    ) {
+        self.node.update_timeline_by_ref(&ref_id, kind.into(), &title, &detail, &target, size_bytes);
+    }
+
+    // ---- Data retention & privacy ----
+
+    /// Returns current item/byte counts and retention settings across local history and caches.
+    pub fn data_retention_counts(&self) -> DataRetentionCounts {
+        self.node.data_retention_counts().into()
+    }
+
+    /// Clears all locally cached `MessagingStyle` chat threads and messages.
+    pub fn clear_message_cache(&self) -> Result<()> {
+        Ok(self.node.clear_message_cache()?)
+    }
+
+    /// Clears all file transfer records from the local timeline without deleting downloaded files.
+    pub fn clear_received_file_history(&self) -> Result<()> {
+        Ok(self.node.clear_received_file_history()?)
+    }
+
+    /// Wipes all local history and caches (encrypted clipboard history, timeline, and message cache)
+    /// while preserving device identity, paired devices, and per-device feature toggles.
+    pub fn clear_all_local_data(&self) -> Result<()> {
+        Ok(self.node.clear_all_local_data()?)
+    }
+
+    // ---- Media ----
+
+    /// This phone's media players changed (most relevant first).
+    pub async fn media_changed(&self, players: Vec<MediaPlayer>) {
+        let node = self.node.clone();
+        self.run(async move { node.media_changed(players.into_iter().map(Into::into).collect()).await })
+            .await;
+    }
+
+    /// Runs a command on a paired device's media player; `position`
+    /// (milliseconds) for seeking.
+    pub async fn media_command(
+        &self,
+        id: String,
+        player: String,
+        action: MediaAction,
+        position: Option<u64>,
+    ) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.media_command(id, player, action.into(), position).await?) }).await
+    }
+
+    // ---- Notifications ----
+
+    /// A notification appeared or changed on this phone.
+    pub async fn notification_posted(&self, notification: Notification) {
+        let node = self.node.clone();
+        self.run(async move { node.notification_posted(notification.into()).await }).await;
+    }
+
+    pub async fn notification_removed(&self, key: String) {
+        let node = self.node.clone();
+        self.run(async move { node.notification_removed(key).await }).await;
+    }
+
+    /// Everything this phone shows now (listener connected), or nothing
+    /// (access revoked).
+    pub async fn notifications_reset(&self, items: Vec<Notification>) {
+        let node = self.node.clone();
+        self.run(async move { node.notifications_reset(items.into_iter().map(Into::into).collect()).await })
+            .await;
+    }
+
+    // ---- This device ----
+
+    pub async fn update_battery(&self, battery: Battery) {
+        let node = self.node.clone();
+        self.run(async move { node.update_battery(battery.into()).await }).await;
+    }
+
+    /// Tells paired devices that `version` is out on `channel` (see
+    /// `Node::announce_update`).
+    pub async fn announce_update(&self, channel: String, version: String) {
+        let node = self.node.clone();
+        self.run(async move { node.announce_update(channel, version).await }).await;
+    }
+
+    pub async fn update_device_info(&self, info: DeviceInfo) {
+        let node = self.node.clone();
+        self.run(async move { node.update_device_info(info.into()).await }).await;
+    }
+
+    /// Updates this phone's Material You seed color (`0xFFRRGGBB` ARGB) and
+    /// sends `HelloUpdate` to connected PCs if it changed.
+    pub async fn update_accent(&self, accent: Option<u32>) {
+        let node = self.node.clone();
+        self.run(async move { node.update_accent(accent).await }).await;
+    }
+
+    /// Updates this phone's power level and the capabilities it offers on
+    /// top of the built-in ones (they depend on permissions and power).
+    pub async fn update_power(&self, power: PowerLevel, mut capabilities: Vec<String>) {
+        if !capabilities.iter().any(|c| c == core::MIRROR_VIEW) {
+            capabilities.push(core::MIRROR_VIEW.into());
+        }
+        let node = self.node.clone();
+        self.run(async move { node.update_power(power.into(), capabilities).await }).await;
+    }
+
+    /// Whether remote / mobile data connections outside the local Wi-Fi/LAN are allowed.
+    pub fn away_mode(&self) -> bool {
+        self.node.away_mode()
+    }
+
+    /// Whether the phone has Wi-Fi, Ethernet or a VPN (#397): without, and
+    /// with mobile data off, PCs aren't dialed until one comes back.
+    pub fn set_local_network(&self, available: bool) {
+        self.node.set_local_network(available);
+    }
+
+    /// Enables or disables connecting over mobile data / non-LAN paths at runtime.
+    pub fn set_away_mode(&self, enabled: bool) {
+        self.node.set_away_mode(enabled);
+    }
+
+    pub fn relay_snapshot(&self) -> RelaySnapshot {
+        use core::relays::RelayRegion as Region;
+        let snapshot = self.node.relay_snapshot();
+        RelaySnapshot {
+            servers: snapshot
+                .servers
+                .into_iter()
+                .map(|server| RelayServer {
+                    url: server.url,
+                    provider: server.provider,
+                    region: match server.region {
+                        Region::NorthAmericaEast => RelayRegion::NorthAmericaEast,
+                        Region::NorthAmericaWest => RelayRegion::NorthAmericaWest,
+                        Region::Europe => RelayRegion::Europe,
+                        Region::AsiaPacific => RelayRegion::AsiaPacific,
+                        Region::Custom => RelayRegion::Custom,
+                    },
+                    enabled: server.enabled,
+                })
+                .collect(),
+            home: snapshot
+                .home
+                .into_iter()
+                .map(|relay| HomeRelay { url: relay.url, connected: relay.connected, failed: relay.failed })
+                .collect(),
+            routes: snapshot
+                .routes
+                .into_iter()
+                .map(|route| RelayRoute { device: route.device, url: route.url })
+                .collect(),
+        }
+    }
+
+    pub fn edit_relay(&self, url: String, action: RelayEdit) -> RelayEditResult {
+        use core::relays::{RelayEdit as Edit, RelayEditError};
+        let action = match action {
+            RelayEdit::Add => Edit::Add,
+            RelayEdit::Enable => Edit::Enable,
+            RelayEdit::Disable => Edit::Disable,
+            RelayEdit::Remove => Edit::Remove,
+        };
+        match self.node.edit_relay(&url, action) {
+            Ok(()) => RelayEditResult::Saved,
+            Err(RelayEditError::InvalidAddress) => RelayEditResult::InvalidAddress,
+            Err(RelayEditError::Duplicate) => RelayEditResult::Duplicate,
+            Err(RelayEditError::Limit) => RelayEditResult::Limit,
+            Err(err) => {
+                tracing::warn!(%err, "can't save relay settings");
+                RelayEditResult::Failed
+            }
+        }
+    }
+
+    pub async fn check_relays(&self) -> Vec<RelayProbe> {
+        let node = self.node.clone();
+        self.run(async move { node.check_relays().await })
+            .await
+            .into_iter()
+            .map(|probe| RelayProbe { url: probe.url, rtt_ms: probe.rtt_ms, timed_out: probe.timed_out })
+            .collect()
+    }
+
+    /// Locks a paired PC (`sleep`: puts it to sleep instead).
+    pub async fn pc_power(&self, id: String, sleep: bool) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        let action = if sleep { core::PowerAction::Sleep } else { core::PowerAction::Lock };
+        self.run(async move { Ok(node.pc_power(id, action).await?) }).await
+    }
+
+    /// Asks a paired PC to play this phone's sound (#398).
+    pub async fn ask_pc_for_phone_sound(&self, id: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.ask_pc_for_phone_sound(id).await?) }).await
+    }
+
+    /// Shuts a paired PC down (only one that offers `pc.power.shutdown`).
+    pub async fn pc_shutdown(&self, id: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.pc_power(id, core::PowerAction::Shutdown).await?) }).await
+    }
+
+    /// Hibernates a paired PC (only one that offers `pc.power.hibernate`).
+    pub async fn pc_hibernate(&self, id: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.pc_power(id, core::PowerAction::Hibernate).await?) }).await
+    }
+
+    /// Sends Wake-on-LAN magic packets for a paired PC over UDP to its stored
+    /// subnet broadcasts and `255.255.255.255` on ports 9 and 7, repeated a
+    /// few times over ~2 s.
+    pub async fn wake(&self, id: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.wake(id).await?) }).await
+    }
+
+    /// Opens a web link on a paired PC.
+    pub async fn open_link(&self, id: String, url: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.open_link(id, url).await?) }).await
+    }
+
+    // ---- Remote input (touchpad, keyboard, presentation) ----
+
+    /// Checks whether a paired PC allows remote mouse/keyboard input from this
+    /// phone (`NectarlinkError::Denied` when `remote_input` is off on the PC,
+    /// which also triggers a one-time confirmation prompt there).
+    pub async fn remote_check(&self, id: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.remote_check(id).await?) }).await
+    }
+
+    /// Moves a paired PC's mouse cursor by `(dx, dy)` logical pixels over
+    /// QUIC datagrams (or the `remote/motion` stream fallback).
+    pub async fn remote_move(&self, id: String, dx: f32, dy: f32) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.remote_move(id, dx, dy).await?) }).await
+    }
+
+    /// Scrolls on a paired PC (`dy` > 0 scrolls down, `dx` > 0 scrolls right,
+    /// in wheel notches). When `fast` is true, sends over QUIC datagrams.
+    pub async fn remote_scroll(&self, id: String, dx: f32, dy: f32, fast: bool) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move {
+            if fast {
+                Ok(node.remote_scroll_fast(id, dx, dy).await?)
+            } else {
+                Ok(node.remote_input(id, core::RemoteInput::Scroll { dx, dy }).await?)
+            }
+        })
+        .await
+    }
+
+    /// Presses, releases or clicks a mouse button (`"left"`, `"right"` or
+    /// `"middle"`; `action`: `"down"`, `"up"` or `"click"`) on a paired PC.
+    pub async fn remote_button(&self, id: String, button: String, action: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let button = match button.as_str() {
+            "left" => core::MouseButton::Left,
+            "right" => core::MouseButton::Right,
+            "middle" => core::MouseButton::Middle,
+            _ => return Err(NectarlinkError::Internal { reason: format!("invalid mouse button: {button}") }),
+        };
+        let action = match action.as_str() {
+            "down" => core::ButtonAction::Down,
+            "up" => core::ButtonAction::Up,
+            "click" => core::ButtonAction::Click,
+            _ => {
+                return Err(NectarlinkError::Internal { reason: format!("invalid button action: {action}") });
+            }
+        };
+        let node = self.node.clone();
+        self.run(
+            async move { Ok(node.remote_input(id, core::RemoteInput::Button { button, action }).await?) },
+        )
+        .await
+    }
+
+    /// Types Unicode text on a paired PC.
+    pub async fn remote_text(&self, id: String, text: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.remote_input(id, core::RemoteInput::Text { text }).await?) }).await
+    }
+
+    /// Presses a named key or shortcut (`key`) with optional modifiers
+    /// (`"ctrl"`, `"alt"`, `"shift"`, `"win"`) on a paired PC.
+    pub async fn remote_key(&self, id: String, key: String, mods: Vec<String>) -> Result<()> {
+        let id = parse_id(&id)?;
+        let mut parsed_mods = Vec::with_capacity(mods.len());
+        for m in mods {
+            let km = match m.as_str() {
+                "ctrl" => core::KeyMod::Ctrl,
+                "alt" => core::KeyMod::Alt,
+                "shift" => core::KeyMod::Shift,
+                "win" => core::KeyMod::Win,
+                _ => return Err(NectarlinkError::Internal { reason: format!("invalid key modifier: {m}") }),
+            };
+            parsed_mods.push(km);
+        }
+        let node = self.node.clone();
+        self.run(async move {
+            Ok(node.remote_input(id, core::RemoteInput::Key { key, mods: parsed_mods }).await?)
+        })
+        .await
+    }
+
+    /// Sends a presentation slide command (`"next"`, `"previous"`, `"start"`,
+    /// `"stop"` or `"black"`) to a paired PC.
+    pub async fn remote_slide(&self, id: String, action: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let action = match action.as_str() {
+            "next" => core::SlideAction::Next,
+            "previous" | "prev" => core::SlideAction::Previous,
+            "start" => core::SlideAction::Start,
+            "stop" => core::SlideAction::Stop,
+            "black" => core::SlideAction::Black,
+            _ => return Err(NectarlinkError::Internal { reason: format!("invalid slide action: {action}") }),
+        };
+        let node = self.node.clone();
+        self.run(async move { Ok(node.remote_input(id, core::RemoteInput::Slide { action }).await?) }).await
+    }
+
+    /// Moves or hides the laser pointer overlay on a paired PC (`x`, `y` in
+    /// `0.0..=1.0`).
+    pub async fn remote_laser(&self, id: String, on: bool, x: f32, y: f32) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.remote_laser(id, on, x, y).await?) }).await
+    }
+
+    /// Sends the phone's game controller as it is now to a paired PC
+    /// (`input.gamepad`). With `reliable`, it goes on the control stream and
+    /// answers whether the PC could plug a controller in
+    /// (`NectarlinkError::Unsupported` when its driver is missing); otherwise
+    /// in a QUIC datagram, repeated by the caller while the controller is open.
+    /// `buttons` uses the XInput bits; sticks run -32768 to 32767, `y` up.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn remote_pad(
+        &self,
+        id: String,
+        buttons: u16,
+        lt: u8,
+        rt: u8,
+        lx: i16,
+        ly: i16,
+        rx: i16,
+        ry: i16,
+        reliable: bool,
+    ) -> Result<()> {
+        let id = parse_id(&id)?;
+        let pad = core::PadState { buttons, lt, rt, lx, ly, rx, ry };
+        let node = self.node.clone();
+        self.run(async move {
+            if reliable {
+                Ok(node.remote_input(id, core::RemoteInput::Pad { pad }).await?)
+            } else {
+                Ok(node.remote_pad(id, pad).await?)
+            }
+        })
+        .await
+    }
+
+    /// Unplugs this phone's game controller on a paired PC.
+    pub async fn remote_pad_off(&self, id: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.remote_input(id, core::RemoteInput::PadOff).await?) }).await
+    }
+
+    // ---- Deck (macro pad) ----
+
+    /// The latest Deck layout reported by a connected PC, if any.
+    pub fn deck_layout(&self, id: String) -> Result<Option<DeckLayout>> {
+        let id = parse_id(&id)?;
+        Ok(self.node.deck_layout(id).map(Into::into))
+    }
+
+    /// The latest live Deck state reported by a connected PC, if any.
+    pub fn deck_state(&self, id: String) -> Result<Option<DeckState>> {
+        let id = parse_id(&id)?;
+        Ok(self.node.deck_state(id).map(Into::into))
+    }
+
+    /// Asks a paired PC to run the action bound to `tile` (`deck.press`).
+    pub async fn deck_press(&self, id: String, tile: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.deck_press(id, tile).await?) }).await
+    }
+
+    /// Asks a paired PC to set its master volume (`0..=100`) and/or mute state (`pc.audio.set`).
+    pub async fn set_pc_audio(&self, id: String, volume: Option<u8>, muted: Option<bool>) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.set_pc_audio(id, volume, muted).await?) }).await
+    }
+
+    /// Asks a paired PC to make one of its audio outputs (by its `id` in
+    /// `DeckState.output_devices`) the default (`pc.audio.set { output }`).
+    pub async fn set_pc_audio_output(&self, id: String, output: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.set_pc_audio_output(id, output).await?) }).await
+    }
+
+    /// The context chip suggestion for the most recently received text clip, if any.
+    pub fn last_clip_suggestion(&self) -> Option<ClipSuggestion> {
+        self.node.last_clip_suggestion().map(|(_, s)| s.into())
+    }
+
+    /// Opens this phone's screen stream to a PC that asked (after the user
+    /// agreed).
+    pub async fn mirror_open(&self, pc_id: String) -> Result<Arc<MirrorStream>> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(Arc::new(MirrorStream(node.mirror_open(id).await?))) }).await
+    }
+
+    /// Opens this phone's sound stream to a PC that asked for it with the
+    /// screen.
+    pub async fn mirror_open_audio(&self, pc_id: String) -> Result<Arc<MirrorStream>> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(Arc::new(MirrorStream(node.mirror_open_audio(id).await?))) }).await
+    }
+
+    /// The Elevated helper's taps and keys are refused by this phone (Xiaomi,
+    /// until USB debugging (Security settings) is on): tells the PC showing
+    /// mirroring `session`, so it can say what to turn on.
+    pub async fn mirror_input_blocked(&self, pc_id: String, session: u32) -> Result<()> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move {
+            node.mirror_notice(id, session, core::MIRROR_NOTICE_INPUT_BLOCKED).await.map_err(Into::into)
+        })
+        .await
+    }
+
+    /// Tells a paired PC that mirroring or remote keyboard input on `session` has stopped (`mirror.stop`).
+    pub async fn mirror_stop(&self, pc_id: String, session: u32) -> Result<()> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move {
+            node.mirror_stop(id, session).await;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Asks a paired PC to stream its screen to this phone (`mirror.start`, `session == 0`),
+    /// or with `watch`, what that PC player plays, with its sound (Play on phone, after the
+    /// PC offered it).
+    pub async fn start_pc_mirror(
+        &self,
+        pc_id: String,
+        max_size: u32,
+        fps: u32,
+        bitrate: u32,
+        watch: Option<String>,
+        display: Option<u32>,
+    ) -> Result<()> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        let options = core::MirrorStart {
+            max_size,
+            fps,
+            bitrate,
+            audio: watch.is_some(),
+            session: core::MIRROR_SCREEN,
+            app: None,
+            stay_awake: false,
+            screen_off: false,
+            watch,
+            sound_only: false,
+            display,
+        };
+        self.run(async move { Ok(node.mirror_start(id, options).await?) }).await
+    }
+
+    /// A paired PC's screens, the main one first, to pick the one to view;
+    /// empty from a PC that only shares its main one (#442).
+    pub async fn pc_displays(&self, pc_id: String) -> Result<Vec<PcDisplay>> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move {
+            Ok(node
+                .mirror_displays(id)
+                .await?
+                .into_iter()
+                .map(|d| PcDisplay { id: d.id, width: d.width, height: d.height, primary: d.primary })
+                .collect())
+        })
+        .await
+    }
+
+    /// Asks a paired PC for a fresh keyframe on its screen stream (`mirror.keyframe`).
+    pub async fn request_pc_mirror_keyframe(&self, pc_id: String) -> Result<()> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move {
+            node.mirror_keyframe(id, core::MIRROR_SCREEN).await;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Sends touch, scroll, key, or text input to a paired PC's mirrored screen (`mirror.input`).
+    pub async fn send_pc_mirror_input(&self, pc_id: String, input: MirrorInputEvent) -> Result<()> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        let input: core::MirrorInput = input.into();
+        self.run(async move { Ok(node.mirror_input(id, core::MIRROR_SCREEN, input).await?) }).await
+    }
+
+    /// Preferred webcam codecs accepted by the connected PC, with H.264 as fallback.
+    pub fn webcam_codecs(&self, pc_id: String) -> Result<Vec<String>> {
+        Ok(self.node.webcam_codecs(parse_id(&pc_id)?)?)
+    }
+
+    /// Screen codecs accepted by the connected receiver, with H.264 fallback.
+    pub fn mirror_codecs(&self, pc_id: String) -> Result<Vec<String>> {
+        Ok(self.node.mirror_codecs(parse_id(&pc_id)?)?)
+    }
+
+    /// Opens this phone's camera stream to a paired PC (`docs/protocol/webcam.md`).
+    pub async fn webcam_open(&self, pc_id: String) -> Result<Arc<MirrorStream>> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(Arc::new(MirrorStream(node.webcam_open(id).await?))) }).await
+    }
+
+    /// Opens this phone's microphone stream to a paired PC (`docs/protocol/mic.md`):
+    /// a config packet (`mirror_audio_config`) first, then 16-bit PCM.
+    pub async fn mic_open(&self, pc_id: String) -> Result<Arc<MirrorStream>> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(Arc::new(MirrorStream(node.mic_open(id).await?))) }).await
+    }
+
+    /// Opens the call's other party to a paired PC (`call.audio`, `downlink`):
+    /// a config packet (`mirror_audio_config(16000, 1)`) first, then 16-bit PCM.
+    pub async fn call_audio_open(&self, pc_id: String) -> Result<Arc<MirrorStream>> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(Arc::new(MirrorStream(node.call_audio_open(id, false).await?))) }).await
+    }
+
+    /// Gives the call's sound back to the phone and tells the PC.
+    pub async fn call_audio_stop(&self, pc_id: String) -> Result<()> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move {
+            node.call_audio_stop(id).await;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Stops this phone's microphone stream to a paired PC and tells the PC.
+    pub async fn mic_stop(&self, pc_id: String) -> Result<()> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move {
+            node.mic_stop(id).await;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Stops this phone's webcam stream to a paired PC and tells the PC.
+    pub async fn webcam_stop(&self, pc_id: String) -> Result<()> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move {
+            node.webcam_stop(id).await;
+            Ok(())
+        })
+        .await
+    }
+
+    /// This phone's messages changed (in `thread`, or anywhere when null):
+    /// PCs that show them catch up.
+    pub async fn sms_changed(&self, thread: Option<String>) {
+        let node = self.node.clone();
+        self.run(async move { node.sms_changed(thread).await }).await;
+    }
+
+    /// This phone's call history changed: PCs that show it catch up.
+    pub async fn call_log_changed(&self) {
+        let node = self.node.clone();
+        self.run(async move { node.call_log_changed().await }).await;
+    }
+
+    /// This phone's contacts changed: PCs that show them catch up.
+    pub async fn contacts_changed(&self) {
+        let node = self.node.clone();
+        self.run(async move { node.contacts_changed().await }).await;
+    }
+
+    /// This phone's photo library changed: PCs that show it catch up.
+    pub async fn photos_changed(&self) {
+        let node = self.node.clone();
+        self.run(async move { node.photos_changed().await }).await;
+    }
+
+    /// A folder on this phone changed (`""` for root): PCs that have it open
+    /// in File Explorer refresh it (`storage.changed`, debounced).
+    pub async fn storage_changed(&self, path: String) {
+        let node = self.node.clone();
+        self.run(async move { node.storage_changed(path).await }).await;
+    }
+
+    /// Directory paths currently watched by any connected PC (most recently
+    /// listed folders).
+    pub fn storage_open_folders(&self) -> Vec<String> {
+        self.node.storage_open_folders()
+    }
+
+    /// A call on this phone rang, was answered or ended: tells the PCs that
+    /// show calls (and are allowed them), now and when they connect during it.
+    pub async fn call_changed(&self, call: Call) -> Result<()> {
+        let node = self.node.clone();
+        let call = core::CallState {
+            id: call.id,
+            state: match call.state {
+                CallPhase::Ringing => "ringing",
+                CallPhase::Active => "active",
+                CallPhase::Ended => "ended",
+            }
+            .into(),
+            incoming: call.incoming,
+            number: call.number,
+            name: call.name,
+            photo: call.photo,
+            missed: call.missed,
+            since: call.since,
+            controls: call.controls.map(|c| core::CallControls {
+                muted: c.muted,
+                speaker: c.speaker,
+                held: c.held,
+                can_hold: c.can_hold,
+            }),
+            app: call.app,
+        };
+        self.run(async move { Ok(node.call_changed(call).await?) }).await
+    }
+
+    /// A photo or screenshot just appeared on this phone: tells the PCs
+    /// that show photos (and are allowed them).
+    pub async fn photo_taken(&self, photo: Photo) -> Result<()> {
+        let node = self.node.clone();
+        let photo = core::Photo {
+            id: photo.id,
+            name: photo.name,
+            size: photo.size,
+            taken: photo.taken,
+            screenshot: photo.screenshot,
+            thumb: photo.thumb,
+        };
+        self.run(async move { Ok(node.photo_taken(photo).await?) }).await
+    }
+
+    /// This phone's quick settings state (on startup and whenever any toggle
+    /// changes): tells the PCs that show toggles (and are allowed them).
+    pub async fn toggles_changed(&self, toggles: PhoneToggles) -> Result<()> {
+        let node = self.node.clone();
+        let toggles: core::PhoneToggles = toggles.into();
+        self.run(async move { Ok(node.toggles_changed(toggles).await?) }).await
+    }
+
+    // ---- Continuity Camera ----
+
+    /// Sends a captured photo or scanned document from this phone to a requesting PC.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_camera_capture_result(
+        &self,
+        pc_id: String,
+        request_id: String,
+        mode: String,
+        file_name: String,
+        mime: String,
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let peer = parse_id(&pc_id)?;
+        let mode = match mode.as_str() {
+            "photo" => core::CameraCaptureMode::Photo,
+            "scan" => core::CameraCaptureMode::Scan,
+            other => {
+                return Err(NectarlinkError::Internal { reason: format!("unknown capture mode {other:?}") });
+            }
+        };
+        let meta = core::CameraCaptureResultMeta {
+            request_id,
+            mode,
+            file_name,
+            mime,
+            size: data.len() as u64,
+            width,
+            height,
+        };
+        let node = self.node.clone();
+        self.run(async move { Ok(node.send_camera_capture_result(peer, meta, data).await?) }).await
+    }
+
+    /// Cancels an in-flight Continuity Camera capture request on either side.
+    pub async fn cancel_camera_capture(
+        &self,
+        peer_id: String,
+        request_id: String,
+        reason: Option<String>,
+    ) -> Result<()> {
+        let peer = parse_id(&peer_id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.cancel_camera_capture(peer, request_id, reason).await?) }).await
+    }
+
+    /// Requests a Continuity Camera capture (`mode` is `"photo"` or `"scan"`) from a paired phone.
+    pub async fn request_camera_capture(
+        &self,
+        peer_id: String,
+        request_id: String,
+        mode: String,
+    ) -> Result<()> {
+        let peer = parse_id(&peer_id)?;
+        let mode = match mode.as_str() {
+            "photo" => core::CameraCaptureMode::Photo,
+            "scan" => core::CameraCaptureMode::Scan,
+            other => {
+                return Err(NectarlinkError::Internal { reason: format!("unknown capture mode {other:?}") });
+            }
+        };
+        let node = self.node.clone();
+        self.run(async move { Ok(node.request_camera_capture(peer, request_id, mode).await?) }).await
+    }
+
+    /// Reconnects to PCs that aren't connected and syncs connected ones.
+    pub async fn refresh(&self) {
+        let node = self.node.clone();
+        self.run(async move { node.refresh().await }).await;
+    }
+
+    /// Call when connectivity changes (Android doesn't tell native code).
+    pub async fn network_changed(&self) {
+        let node = self.node.clone();
+        self.run(async move { node.network_changed().await }).await;
+    }
+
+    /// Play on phone: reads up to `length` bytes (at most 4 MiB) from
+    /// `offset` of the video file the PC `peer` offered. Blocks; call off the
+    /// main thread (a player's data source does).
+    pub fn watch_file_read(
+        &self,
+        peer: String,
+        offset: u64,
+        length: u64,
+    ) -> Result<WatchFileChunk, NectarlinkError> {
+        let peer_id = parse_id(&peer)?;
+        let node = self.node.clone();
+        let (size, data) =
+            self.block_on_rt(async move { node.watch_file_read(peer_id, offset, length).await })?;
+        Ok(WatchFileChunk { size, data })
+    }
+
+    /// Lists entries in a directory on a connected paired device (`storage.list`).
+    /// `Denied` from a PC: it doesn't share its folders.
+    pub fn list_remote_storage(
+        &self,
+        peer: String,
+        path: String,
+    ) -> Result<Vec<RemoteStorageEntry>, NectarlinkError> {
+        let peer_id = parse_id(&peer)?;
+        let node = self.node.clone();
+        let req_path = path.clone();
+        let entries = self.block_on_rt(async move { node.list_storage(&peer_id, &req_path).await })?;
+        let prefix = path.trim_matches('/');
+        Ok(entries
+            .into_iter()
+            .map(|e| RemoteStorageEntry {
+                path: if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) },
+                name: e.name,
+                kind: if e.is_dir { "dir".into() } else { "file".into() },
+                size: e.size,
+                modified: e.modified,
+            })
+            .collect())
+    }
+
+    /// Downloads a remote file from a connected paired device (`storage.read`) in
+    /// 128 KiB chunks into `local_dest`.
+    pub fn download_remote_storage(&self, peer: String, remote_path: String, local_dest: String) -> bool {
+        let Ok(peer_id) = parse_id(&peer) else {
+            return false;
+        };
+        let node = self.node.clone();
+        self.block_on_rt(async move {
+            use tokio::io::AsyncWriteExt;
+            // tokio's file I/O keeps the runtime's two worker threads free.
+            if let Some(parent) = std::path::Path::new(&local_dest).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let Ok(mut f) = tokio::fs::File::create(&local_dest).await else {
+                return false;
+            };
+            let mut offset = 0u64;
+            let chunk_len = 128 * 1024u64;
+            // Complete only once every byte the peer says the file has is
+            // here: a read that comes back short or empty before then (the
+            // file shrank, the peer stopped) is a failed download, not a
+            // smaller file.
+            let complete = loop {
+                let Ok((meta, chunk)) =
+                    node.storage_read(peer_id, remote_path.clone(), offset, Some(chunk_len)).await
+                else {
+                    break false;
+                };
+                if meta.size == 0 {
+                    break true;
+                }
+                if chunk.is_empty() || f.write_all(&chunk).await.is_err() {
+                    break false;
+                }
+                offset += chunk.len() as u64;
+                if offset >= meta.size {
+                    break true;
+                }
+            };
+            if complete && f.flush().await.is_ok() {
+                return true;
+            }
+            drop(f);
+            let _ = tokio::fs::remove_file(&local_dest).await;
+            false
+        })
+    }
+
+    /// Asks a connected paired peer on the target LAN to broadcast a Wake-on-LAN
+    /// magic packet for `mac` (`wake.relay`).
+    pub fn wake_via_relay(&self, relay_peer: String, mac: String, broadcast: Option<String>) -> Result<()> {
+        let peer_id = parse_id(&relay_peer)?;
+        let mac_bytes = core::parse_mac(&mac)
+            .ok_or_else(|| NectarlinkError::Internal { reason: "invalid MAC address".into() })?;
+        let bcast = match broadcast.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => Some(s.parse::<std::net::Ipv4Addr>().map_err(|_| NectarlinkError::Internal {
+                reason: "invalid broadcast IPv4 address".into(),
+            })?),
+            None => None,
+        };
+        let node = self.node.clone();
+        self.block_on_rt(async move { Ok(node.wake_via_relay(&peer_id, mac_bytes, bcast).await?) })
+    }
+}
+
+/// Classifies a text clip into a single context chip suggestion (`None` for
+/// OTPs or plain text).
+#[uniffi::export]
+pub fn classify_clip(text: String) -> Option<ClipSuggestion> {
+    core::classify_clip(&text).map(Into::into)
+}
+
+/// Builds a web search URL for a parcel tracking number.
+#[uniffi::export]
+pub fn tracking_search_url(tracking_number: String) -> String {
+    core::tracking_search_url(&tracking_number)
+}
+
+/// Builds a web maps URL for a street address.
+#[uniffi::export]
+pub fn maps_web_url(address: String) -> String {
+    core::maps_web_url(&address)
+}
+
+/// Kind of rich Handoff link (`docs/protocol/actions.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum HandoffKind {
+    WebLink,
+    VideoLink,
+    MapLocation,
+}
+
+impl From<core::HandoffKind> for HandoffKind {
+    fn from(k: core::HandoffKind) -> Self {
+        match k {
+            core::HandoffKind::WebLink => HandoffKind::WebLink,
+            core::HandoffKind::VideoLink => HandoffKind::VideoLink,
+            core::HandoffKind::MapLocation => HandoffKind::MapLocation,
+        }
+    }
+}
+
+/// Rich Handoff link metadata extracted from a URL, `geo:` URI, or shared text.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct HandoffLink {
+    pub kind: HandoffKind,
+    pub url: String,
+    pub label: String,
+    pub timestamp_secs: Option<u32>,
+    pub map_query: Option<String>,
+}
+
+impl From<core::HandoffLink> for HandoffLink {
+    fn from(h: core::HandoffLink) -> Self {
+        HandoffLink {
+            kind: h.kind.into(),
+            url: h.url,
+            label: h.label,
+            timestamp_secs: h.timestamp_secs,
+            map_query: h.map_query,
+        }
+    }
+}
+
+/// Extracts and classifies a Handoff link (`http://`, `https://`, or `geo:`)
+/// from a URL or shared text snippet.
+#[uniffi::export]
+pub fn extract_handoff_link(text: String) -> Option<HandoffLink> {
+    core::extract_handoff_link(&text).map(Into::into)
+}
+
+/// Attaches or updates a playback timestamp (`?t=123` / `&t=123s`) on a
+/// YouTube, Vimeo, or direct video link.
+#[uniffi::export]
+pub fn with_video_timestamp(url: String, seconds: u32) -> String {
+    core::with_video_timestamp(&url, seconds)
+}
+
+/// Converts a `geo:` URI into a Google Maps `https://` URL.
+#[uniffi::export]
+pub fn geo_to_maps_https(uri: String) -> Option<String> {
+    core::geo_to_maps_https(&uri)
+}
+
+/// Returns true when `name` is a safe document/media file (not an executable or
+/// script) that may be opened automatically on arrival.
+#[uniffi::export]
+pub fn is_safe_handoff_document(name: String) -> bool {
+    core::is_safe_handoff_document(&name)
+}
+
+/// 15 Material 3 / Bloom color roles (`0xRRGGBB` each) for light or dark mode.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiRolePalette {
+    pub primary: u32,
+    pub on_primary: u32,
+    pub primary_container: u32,
+    pub on_primary_container: u32,
+    pub secondary_container: u32,
+    pub on_secondary_container: u32,
+    pub surface: u32,
+    pub surface_container_low: u32,
+    pub surface_container: u32,
+    pub surface_container_high: u32,
+    pub surface_container_highest: u32,
+    pub on_surface: u32,
+    pub on_surface_variant: u32,
+    pub outline: u32,
+    pub outline_variant: u32,
+}
+
+impl From<core::RolePalette> for FfiRolePalette {
+    fn from(p: core::RolePalette) -> Self {
+        Self {
+            primary: p.primary,
+            on_primary: p.on_primary,
+            primary_container: p.primary_container,
+            on_primary_container: p.on_primary_container,
+            secondary_container: p.secondary_container,
+            on_secondary_container: p.on_secondary_container,
+            surface: p.surface,
+            surface_container_low: p.surface_container_low,
+            surface_container: p.surface_container,
+            surface_container_high: p.surface_container_high,
+            surface_container_highest: p.surface_container_highest,
+            on_surface: p.on_surface,
+            on_surface_variant: p.on_surface_variant,
+            outline: p.outline,
+            outline_variant: p.outline_variant,
+        }
+    }
+}
+
+/// Complete light + dark theme scheme generated by the shared Rust perceptual color engine.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiThemeScheme {
+    pub seed_rgb: u32,
+    pub achromatic: bool,
+    pub light: FfiRolePalette,
+    pub dark: FfiRolePalette,
+}
+
+impl From<core::ThemeScheme> for FfiThemeScheme {
+    fn from(s: core::ThemeScheme) -> Self {
+        let to_role = |p: core::RolePalette| FfiRolePalette {
+            primary: p.primary,
+            on_primary: p.on_primary,
+            primary_container: p.primary_container,
+            on_primary_container: p.on_primary_container,
+            secondary_container: p.secondary_container,
+            on_secondary_container: p.on_secondary_container,
+            surface: p.surface,
+            surface_container_low: p.surface_container_low,
+            surface_container: p.surface_container,
+            surface_container_high: p.surface_container_high,
+            surface_container_highest: p.surface_container_highest,
+            on_surface: p.on_surface,
+            on_surface_variant: p.on_surface_variant,
+            outline: p.outline,
+            outline_variant: p.outline_variant,
+        };
+        Self {
+            seed_rgb: s.seed_rgb,
+            achromatic: s.achromatic,
+            light: to_role(s.light),
+            dark: to_role(s.dark),
+        }
+    }
+}
+
+/// Downsamples an RGBA8 image buffer to `<= 112×112`, trims borders, extracts the
+/// perceptual seed (or detects a monochrome cover), and returns its [`FfiThemeScheme`].
+#[uniffi::export]
+pub fn extract_artwork_scheme(
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    cache_key: Option<String>,
+) -> Option<FfiThemeScheme> {
+    core::extract_artwork_scheme_rgba(&rgba, width, height, cache_key.as_deref()).map(Into::into)
+}
+
+/// Builds a complete light + dark [`FfiThemeScheme`] from a `0xRRGGBB` seed color.
+#[uniffi::export]
+pub fn theme_scheme_from_seed(seed_rgb: u32) -> FfiThemeScheme {
+    core::scheme_from_seed_rgb(seed_rgb).into()
+}
+
+/// The install ID for a platform ID that survives reinstalls (Android's `ANDROID_ID`):
+/// a salted hash, so the raw ID never leaves the device. `None` for an empty input.
+#[uniffi::export]
+pub fn install_id_from(platform_id: String) -> Option<String> {
+    core::install_id_from(&platform_id)
+}
+
+/// What's new (#461), kept in `dir` (the app's data folder): at start, after
+/// an update or on a first install, so the dot shows when an update brought
+/// something not seen yet.
+#[uniffi::export]
+pub fn whats_new_note_start(dir: String, updated: bool) {
+    nectarlink_core::whats_new::note_start(std::path::Path::new(&dir), updated);
+}
+
+/// Whether What's new has something not seen yet (the dot).
+#[uniffi::export]
+pub fn whats_new_pending(dir: String) -> bool {
+    nectarlink_core::whats_new::pending(std::path::Path::new(&dir))
+}
+
+/// What's new as JSON: `{version, mode, newCount, groups: [{title, items,
+/// more}], url}`, one short line per change.
+#[uniffi::export]
+pub fn whats_new_json(dir: String) -> String {
+    nectarlink_core::whats_new::json(std::path::Path::new(&dir))
+}
+
+/// What's new was opened: the dot goes, and what it showed stays to show again.
+#[uniffi::export]
+pub fn whats_new_mark_seen(dir: String) {
+    nectarlink_core::whats_new::mark_seen(std::path::Path::new(&dir));
+}
+
+/// One of the two activity log files on a phone.
+const PHONE_LOG_SEGMENT_BYTES: u64 = 256 * 1024;
+
+/// Sends core logs to the platform log (logcat on Android) and to the
+/// private activity log in `diag_dir/logs` (`nectarlink_core::diag`), and
+/// keeps a record of any Rust panic in `diag_dir/crashes`. Call once, before
+/// starting the node; later calls change nothing. `filter` uses tracing's
+/// syntax, e.g. "info"; `data_dir` is the app's own folder, named in log
+/// text instead of spelled out.
+#[uniffi::export]
+pub fn init_logging(filter: String, diag_dir: String, data_dir: String, version: String) {
+    use std::sync::Arc;
+
+    use core::diag::{self, RingLayer, RingLog};
+    use tracing_subscriber::{EnvFilter, prelude::*};
+    let diag_dir = std::path::PathBuf::from(diag_dir);
+    let _ = DIAG_DIR.set(diag_dir.clone());
+    diag::init_roots(std::path::Path::new(&data_dir));
+    diag::crash::configure(&diag_dir, &version);
+    diag::health::init(&diag_dir);
+    diag::crash::install_panic_hook();
+    let filter = EnvFilter::try_new(&filter).unwrap_or_else(|_| EnvFilter::new("info"));
+    #[cfg(target_os = "android")]
+    let layer = paranoid_android::layer("Nectarlink").with_ansi(false);
+    #[cfg(not(target_os = "android"))]
+    let layer = tracing_subscriber::fmt::layer();
+    let ring = RingLog::open(&diag_dir.join("logs"), PHONE_LOG_SEGMENT_BYTES)
+        .ok()
+        .map(|r| RingLayer::new(Arc::new(r)));
+    let _ = tracing_subscriber::registry().with(filter).with(layer).with(ring).try_init();
+}
+
+/// Counts one `feature` that went `code` in the feature health counts
+/// (`nectarlink_core::diag::health`). Unknown names are ignored.
+#[uniffi::export]
+pub fn count_health(feature: String, code: String) {
+    use core::diag::health::{Code, Feature, count};
+    if let (Some(feature), Some(code)) = (Feature::parse(&feature), Code::parse(&code)) {
+        count(feature, code);
+    }
+}
+
+/// Writes the feature health counts so far (when the app goes to the
+/// background: Android may end it without warning after that).
+#[uniffi::export]
+pub fn flush_health() {
+    core::diag::health::flush();
+}
+
+/// A crash the phone app found itself (its own Java or Kotlin crash, or one
+/// Android reported), kept with the core's own records. `kind` is
+/// `exception`, `native` or `anr`; `location` and `message` must be fixed
+/// text and names from the app's code, never values.
+#[uniffi::export]
+pub fn record_crash(kind: String, location: String, message: String, thread: Option<String>, at: u64) {
+    use core::diag::crash;
+    let clean = |text: &str| -> String { core::diag::redact::text(text).chars().take(200).collect() };
+    let (kind, location, message) = (clean(&kind), clean(&location), clean(&message));
+    let record = crash::CrashRecord {
+        sig: crash::signature(&[&kind, &location, &message]),
+        kind,
+        location,
+        message,
+        thread: thread.map(|t| clean(&t)),
+        version: crash::version(),
+        at,
+    };
+    crash::record(&record);
+    core::diag::health::count(core::diag::health::Feature::Crash, core::diag::health::Code::Ok);
+}
+
+/// Where the phone keeps its diagnostics, from [`init_logging`].
+static DIAG_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+/// The report made last, for Send and Open on GitHub.
+static LAST_REPORT: std::sync::Mutex<Option<core::diag::report::Report>> = std::sync::Mutex::new(None);
+
+fn diag_dir() -> std::path::PathBuf {
+    DIAG_DIR.get().cloned().unwrap_or_default()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// A `name: value` fact, or a check and its outcome, for a report.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ReportPair {
+    pub name: String,
+    pub value: String,
+}
+
+/// Paired devices' parts from `report_ask`, by device.
+static PEER_PARTS: std::sync::Mutex<Option<std::collections::HashMap<DeviceId, core::PeerPart>>> =
+    std::sync::Mutex::new(None);
+
+struct PeerParts(std::sync::MutexGuard<'static, Option<std::collections::HashMap<DeviceId, core::PeerPart>>>);
+
+impl std::ops::Deref for PeerParts {
+    type Target = std::collections::HashMap<DeviceId, core::PeerPart>;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("made on lock")
+    }
+}
+
+impl std::ops::DerefMut for PeerParts {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("made on lock")
+    }
+}
+
+fn peer_parts() -> PeerParts {
+    let mut guard = PEER_PARTS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get_or_insert_with(Default::default);
+    PeerParts(guard)
+}
+
+/// Adds a log that arrived to the part it was asked with. False when no
+/// part is waiting for it.
+fn peer_log_arrived(device: DeviceId, nonce: u64, lines: Option<Vec<String>>) -> bool {
+    let mut parts = peer_parts();
+    let Some(part) = parts.get_mut(&device).filter(|p| p.nonce == nonce) else { return false };
+    part.log = core::PeerLog::NotAsked;
+    if let Some(lines) = lines {
+        part.part.log = lines;
+    }
+    true
+}
+
+/// What became of asking a paired device for its part of a report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ReportPeer {
+    /// Its part is in the report.
+    Included,
+    /// Its part is in, and its user is being asked to share its log.
+    Asking,
+    /// Its part is in; it was asked for its log moments ago.
+    Busy,
+    /// It's offline, or didn't answer in time.
+    Offline,
+    /// It runs a NectarLink that doesn't answer yet.
+    Unsupported,
+}
+
+/// What a device says about itself in a report: versions and hardware,
+/// never names. `extra` and `checks` come from fixed lists.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ReportDevice {
+    /// The paired device's ID; "" for this phone.
+    #[uniffi(default = "")]
+    pub id: String,
+    /// `Phone` or `PC`.
+    pub role: String,
+    pub app_version: String,
+    pub channel: String,
+    pub install: String,
+    pub os: String,
+    pub arch: String,
+    pub hardware: Vec<String>,
+    pub extra: Vec<ReportPair>,
+    pub checks: Vec<ReportPair>,
+}
+
+impl ReportDevice {
+    fn split(self) -> (core::diag::report::DeviceFacts, Vec<(String, String)>) {
+        let pairs = |list: Vec<ReportPair>| list.into_iter().map(|p| (p.name, p.value)).collect::<Vec<_>>();
+        let checks = pairs(self.checks);
+        let facts = core::diag::report::DeviceFacts {
+            role: self.role,
+            app_version: self.app_version,
+            channel: self.channel,
+            install: self.install,
+            os: self.os,
+            arch: self.arch,
+            hardware: self.hardware,
+            extra: pairs(self.extra),
+        };
+        (facts, checks)
+    }
+}
+
+/// The area a recent crash or failure on this phone points to: an `Area` id.
+#[uniffi::export]
+pub fn report_guess_area() -> String {
+    core::diag::report::guess_area(&diag_dir()).id().to_owned()
+}
+
+/// Makes a report on this phone and returns its exact text. `phone` is this
+/// phone with its checks; `others` are paired devices as far as the phone
+/// knows them. `parts` leaves out the parts whose bit isn't set (1 devices,
+/// 2 checks, 4 health, 8 crashes, 16 log).
+#[uniffi::export]
+pub fn report_prepare(
+    area: String,
+    other: String,
+    text: String,
+    just_now: bool,
+    parts: i32,
+    phone: ReportDevice,
+    others: Vec<ReportDevice>,
+) -> String {
+    use core::diag::report::{self, Area, DevicePart, Parts};
+    let dir = diag_dir();
+    let mut made = report::Report::new(Area::parse(&area).unwrap_or(Area::Other), &other, &text, just_now);
+    made.parts = Parts {
+        devices: parts & 1 != 0,
+        checks: parts & 2 != 0,
+        health: parts & 4 != 0,
+        crashes: parts & 8 != 0,
+        log: parts & 16 != 0,
+    };
+    let (facts, checks) = phone.split();
+    made.devices.push(report::local_part(&dir, &dir.join("logs"), facts, checks, just_now));
+    if others.is_empty() {
+        made.missing.push("no_paired_device".into());
+    }
+    let parts = peer_parts();
+    for device in others {
+        let asked = parse_id(&device.id).ok().and_then(|id| parts.get(&id));
+        let role = device.role.clone();
+        let (mut facts, checks) = device.split();
+        match asked {
+            Some(peer) => {
+                let mut part = peer.part.clone();
+                part.facts.role = role;
+                part.facts.extra.extend(facts.extra);
+                if peer.log == core::PeerLog::Asking && made.parts.log {
+                    made.missing
+                        .push(format!("{}_log_waiting_for_its_user", part.facts.role.to_ascii_lowercase()));
+                }
+                made.devices.push(part);
+            }
+            None => {
+                facts.role = role;
+                made.devices.push(DevicePart { facts, checks, ..DevicePart::default() });
+            }
+        }
+    }
+    drop(parts);
+    let rendered = made.render();
+    *LAST_REPORT.lock().unwrap_or_else(|e| e.into_inner()) = Some(made);
+    rendered
+}
+
+/// Whether `text` seems to have an email address or phone number in it.
+#[uniffi::export]
+pub fn report_looks_like_contact(text: String) -> bool {
+    core::diag::report::looks_like_contact(&text)
+}
+
+/// A new GitHub issue for the report made last, with its short parts
+/// filled in; the full text is pasted into it.
+#[uniffi::export]
+pub fn report_issue_url() -> Option<String> {
+    LAST_REPORT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(core::diag::report::Report::issue_url)
+}
+
+/// A report ready to POST to [`report_service`]`/v1/report`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct OutgoingReport {
+    pub rid: String,
+    /// Sent as is, as `application/json`.
+    pub body: String,
+    /// Sent as `X-Proof`.
+    pub proof: String,
+    pub at: u64,
+}
+
+impl From<core::diag::send::Outgoing> for OutgoingReport {
+    fn from(o: core::diag::send::Outgoing) -> Self {
+        OutgoingReport { rid: o.rid, body: o.body, proof: o.proof, at: o.at }
+    }
+}
+
+impl From<OutgoingReport> for core::diag::send::Outgoing {
+    fn from(o: OutgoingReport) -> Self {
+        core::diag::send::Outgoing { rid: o.rid, body: o.body, proof: o.proof, at: o.at }
+    }
+}
+
+/// The report service's address.
+#[uniffi::export]
+pub fn report_service() -> String {
+    core::diag::send::REPORT_SERVICE.to_owned()
+}
+
+/// The request for the report made last, with its proof of work. Takes
+/// about a second: call it off the main thread. `crash_sig` makes it a
+/// crash report, sent from the crash card.
+#[uniffi::export]
+pub fn report_outgoing(crash_sig: Option<String>) -> Option<OutgoingReport> {
+    use core::diag::send::{Kind, Outgoing};
+    let made = LAST_REPORT.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+    let kind = if crash_sig.is_some() { Kind::Crash } else { Kind::Person };
+    Some(Outgoing::new(&made, kind, crash_sig.as_deref(), now_secs()).into())
+}
+
+/// What became of a sent report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ReportOutcome {
+    Filed {
+        issue: u64,
+    },
+    Queued,
+    /// Couldn't reach the service: kept, and sent at the next chance.
+    Later,
+    Limited,
+    Failed,
+}
+
+/// Reads the service's answer to `outgoing` (`status` 0 when it couldn't be
+/// reached), keeps what has to be kept, and says what happened. `follow`
+/// checks its issue for replies later (not for crash reports, whose issue
+/// gets a count comment).
+#[uniffi::export]
+pub fn report_answer(outgoing: OutgoingReport, status: u16, body: Vec<u8>, follow: bool) -> ReportOutcome {
+    use core::diag::send::{self, Answer, Sent};
+    let dir = diag_dir();
+    let answer = if status == 0 { Answer::Later } else { Answer::read(status, &body) };
+    let outgoing: send::Outgoing = outgoing.into();
+    let keep = |issue: Option<u64>| {
+        send::clear_pending_if(&dir, &outgoing.rid);
+        if !follow {
+            return;
+        }
+        send::remember(
+            &dir,
+            Sent { rid: outgoing.rid.clone(), issue, at: outgoing.at, comments: 0, closed: false },
+            now_secs(),
+        );
+    };
+    match answer {
+        Answer::Filed { issue } => {
+            keep(Some(issue));
+            ReportOutcome::Filed { issue }
+        }
+        Answer::Queued => {
+            keep(None);
+            ReportOutcome::Queued
+        }
+        Answer::Later => {
+            send::keep_pending(&dir, &outgoing);
+            ReportOutcome::Later
+        }
+        Answer::Limited => ReportOutcome::Limited,
+        Answer::Refused => {
+            send::clear_pending_if(&dir, &outgoing.rid);
+            ReportOutcome::Failed
+        }
+    }
+}
+
+/// What this phone says about itself in the daily count.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CountInstall {
+    pub app: String,
+    pub channel: String,
+    pub platform: String,
+    pub os: String,
+    pub hardware: String,
+}
+
+/// Today's count to POST to `report_service()/v1/ping` (as JSON, with
+/// `X-Proof`), or null when it went out already today.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DailyCount {
+    pub body: String,
+    pub proof: String,
+}
+
+#[uniffi::export]
+pub fn daily_count_due(install: CountInstall) -> Option<DailyCount> {
+    let install = core::diag::usage::Install {
+        app: install.app,
+        channel: install.channel,
+        platform: install.platform,
+        os: install.os,
+        hardware: install.hardware,
+    };
+    core::diag::usage::due(&diag_dir(), &install, now_secs()).map(|(body, proof)| DailyCount { body, proof })
+}
+
+/// Today's count went out (or was refused for good): not again today.
+#[uniffi::export]
+pub fn daily_count_sent() {
+    core::diag::usage::sent(&diag_dir(), now_secs());
+}
+
+/// The report that couldn't be sent yet, to send at the next update check.
+#[uniffi::export]
+pub fn report_pending() -> Option<OutgoingReport> {
+    core::diag::send::pending(&diag_dir()).map(Into::into)
+}
+
+/// Sent reports still waiting in the service's queue: their `rid`s, to ask
+/// `GET /v1/report/<rid>` which issue each became.
+#[uniffi::export]
+pub fn report_queued() -> Vec<String> {
+    core::diag::send::sent(&diag_dir(), now_secs())
+        .into_iter()
+        .filter(|s| s.issue.is_none())
+        .map(|s| s.rid)
+        .collect()
+}
+
+/// A sent report this phone follows for replies.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FollowedReport {
+    pub rid: String,
+    pub issue: u64,
+    /// GitHub's public API address for it.
+    pub url: String,
+}
+
+/// Something new on a followed report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ReportNotice {
+    Replied { issue: u64 },
+    Closed { issue: u64 },
+}
+
+/// The crash on the crash card.
+static CARD: std::sync::Mutex<Option<core::diag::crash::CrashRecord>> = std::sync::Mutex::new(None);
+
+/// A crash the crash card offers to report.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CrashCard {
+    pub sig: String,
+    /// The report area it points to (an `Area` id).
+    pub area: String,
+}
+
+/// The crash the crash card should offer for this `version`: once per
+/// crash per version, unless turned off.
+#[uniffi::export]
+pub fn crash_card(version: String) -> Option<CrashCard> {
+    let record = core::diag::crash::for_card(&diag_dir(), &version, now_secs())?;
+    let card = CrashCard {
+        sig: record.sig.clone(),
+        area: core::diag::report::Area::guess(Some(&record.location), None).id().to_owned(),
+    };
+    *CARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(record);
+    Some(card)
+}
+
+/// The version that fixes the card's crash, from the known-crashes `list`
+/// (`known_crashes_url()`), when a newer one does.
+#[uniffi::export]
+pub fn crash_card_fixed_in(list: Vec<u8>) -> Option<String> {
+    let card = CARD.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+    core::diag::known::fixed_in(&list, &card.sig, &card.version)
+}
+
+/// Where the list of crashes already fixed is.
+#[uniffi::export]
+pub fn known_crashes_url() -> String {
+    core::diag::known::KNOWN_URL.to_owned()
+}
+
+/// The card was answered (sent, looked at, or put away): not again for it.
+#[uniffi::export]
+pub fn crash_card_done() {
+    if let Some(record) = CARD.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        core::diag::crash::card_shown(&diag_dir(), &record);
+    }
+}
+
+/// "Don't ask about crashes".
+#[uniffi::export]
+pub fn crash_card_off() {
+    core::diag::crash::card_off(&diag_dir());
+    CARD.lock().unwrap_or_else(|e| e.into_inner()).take();
+}
+
+/// The sent reports to check for replies (at most 3, for 30 days).
+#[uniffi::export]
+pub fn report_followed() -> Vec<FollowedReport> {
+    core::diag::send::sent(&diag_dir(), now_secs())
+        .into_iter()
+        .filter_map(|s| {
+            s.issue.map(|issue| FollowedReport {
+                rid: s.rid,
+                issue,
+                url: core::diag::send::issue_api_url(issue),
+            })
+        })
+        .collect()
+}
+
+/// GitHub's answer about followed report `rid`: what's new, if anything.
+#[uniffi::export]
+pub fn report_issue_answer(rid: String, status: u16, body: Vec<u8>) -> Option<ReportNotice> {
+    use core::diag::send::{self, Notice};
+    send::check_issue(&diag_dir(), &rid, status, &body, now_secs()).map(|n| match n {
+        Notice::Replied { issue } => ReportNotice::Replied { issue },
+        Notice::Closed { issue } => ReportNotice::Closed { issue },
+    })
+}
+
+/// The service's answer about the queued report `rid`.
+#[uniffi::export]
+pub fn report_queued_answer(rid: String, status: u16, body: Vec<u8>) {
+    use core::diag::send::{self, Answer};
+    let dir = diag_dir();
+    match Answer::read(status, &body) {
+        Answer::Filed { issue } => {
+            if let Some(entry) = send::sent(&dir, now_secs()).into_iter().find(|s| s.rid == rid) {
+                send::remember(&dir, send::Sent { issue: Some(issue), ..entry }, now_secs());
+            }
+        }
+        Answer::Refused => send::forget(&dir, &rid),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn errors_map_to_actionable_variants() {
+        assert_eq!(NectarlinkError::from(core::Error::Offline), NectarlinkError::Offline);
+        assert_eq!(
+            NectarlinkError::from(core::Error::VersionTooOld { side: core::Side::Remote }),
+            NectarlinkError::VersionTooOld { this_device: false }
+        );
+        assert!(matches!(
+            NectarlinkError::from(core::Error::Internal("x".into())),
+            NectarlinkError::Internal { reason } if reason == "x"
+        ));
+    }
+
+    #[test]
+    fn device_info_round_trips() {
+        let info = DeviceInfo {
+            name: "Pixel".into(),
+            kind: DeviceKind::Phone,
+            os: "android".into(),
+            os_version: "16".into(),
+            model: Some("Google Pixel 9".into()),
+            accent: Some(0xFF8A5100),
+            screen: Some(ScreenShape {
+                v: 1,
+                aspect: 0.45,
+                corners: Some(ScreenCorners { tl: 0.088, tr: 0.088, br: 0.088, bl: 0.088 }),
+                cutouts: vec![ScreenRect { x: 0.46, y: 0.018, w: 0.08, h: 0.036 }],
+                cutout_path: None,
+            }),
+            install_id: None,
+        };
+        assert_eq!(DeviceInfo::from(core::DeviceInfo::from(info.clone())), info);
+    }
+
+    #[test]
+    fn batteries_are_clamped() {
+        let b: core::Battery = Battery {
+            level: 140,
+            charging: true,
+            plugged: None,
+            full_in: Some(30),
+            cell_bars: Some(7),
+            cell_type: Some("  5G\n".into()),
+            wifi_bars: Some(9),
+        }
+        .into();
+        assert_eq!(b.level, 100);
+        assert_eq!(b.full_in, Some(30));
+        assert_eq!(b.cell_bars, Some(4));
+        assert_eq!(b.cell_type.as_deref(), Some("5G"));
+        assert_eq!(b.wifi_bars, Some(4));
+        let back = Battery::from(b);
+        assert_eq!(back.cell_bars, Some(4));
+        assert_eq!(back.cell_type.as_deref(), Some("5G"));
+        assert_eq!(back.wifi_bars, Some(4));
+    }
+
+    #[test]
+    fn pc_audio_frame_event_and_remote_storage_entry() {
+        let id = DeviceId([7u8; 32]);
+        let ev = Event::from_node(NodeEvent::PcAudioFrame {
+            device: id,
+            sample_rate: 48_000,
+            channels: 2,
+            pcm: vec![1, 2, 3, 4],
+        });
+        assert_eq!(
+            ev,
+            Some(Event::PcAudioFrame {
+                device: id.to_string(),
+                sample_rate: 48_000,
+                channels: 2,
+                pcm: vec![1, 2, 3, 4],
+            })
+        );
+        let entry = RemoteStorageEntry {
+            name: "photo.jpg".into(),
+            path: "DCIM/photo.jpg".into(),
+            kind: "file".into(),
+            size: 4096,
+            modified: 1_700_000_000,
+        };
+        assert_eq!(entry.kind, "file");
+    }
+}
+
+/// `app.nectarlink.android.core.AndroidContext.nativeInstall(context)`: gives the
+/// core the application's `Context`, so it reads the phone's DNS servers
+/// (see `nectarlink_core::install_android_context`). The library is loaded
+/// with `System.loadLibrary` for this; JNA's calls use the same copy.
+#[cfg(target_os = "android")]
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_nectarlink_android_core_AndroidContext_nativeInstall(
+    env: *mut jni_sys::JNIEnv,
+    _class: jni_sys::jclass,
+    context: jni_sys::jobject,
+) {
+    // Set only once it worked, so a failed call can be tried again.
+    static INSTALLED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    let mut installed = INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
+    if *installed || env.is_null() || context.is_null() {
+        return;
+    }
+    // SAFETY: `env` is the calling thread's JNI environment (checked
+    // non-null), valid for this call; the global reference keeps `context`
+    // alive for good, and the JavaVM lives as long as the process.
+    unsafe {
+        let functions = &**env;
+        let mut vm: *mut jni_sys::JavaVM = std::ptr::null_mut();
+        if (functions.v1_1.GetJavaVM)(env, &mut vm) != jni_sys::JNI_OK || vm.is_null() {
+            return;
+        }
+        let global = (functions.v1_1.NewGlobalRef)(env, context);
+        if global.is_null() {
+            return;
+        }
+        nectarlink_core::install_android_context(vm.cast(), global.cast());
+    }
+    *installed = true;
+}

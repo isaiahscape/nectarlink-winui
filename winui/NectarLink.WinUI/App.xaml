@@ -1,0 +1,45 @@
+<Application
+    x:Class="NectarLink.WinUI.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+            </ResourceDictionary.MergedDictionaries>
+
+            <SolidColorBrush x:Key="NlPrimaryBrush" Color="#F0B35C" />
+            <SolidColorBrush x:Key="NlOnPrimaryBrush" Color="#3B280D" />
+            <SolidColorBrush x:Key="NlPrimaryContainerBrush" Color="#593F19" />
+            <SolidColorBrush x:Key="NlOnPrimaryContainerBrush" Color="#FFE0B2" />
+            <SolidColorBrush x:Key="NlSecondaryContainerBrush" Color="#3B3329" />
+            <SolidColorBrush x:Key="NlOnSecondaryContainerBrush" Color="#E8DDCE" />
+            <SolidColorBrush x:Key="NlSurfaceBrush" Color="#1F2124" />
+            <SolidColorBrush x:Key="NlSurfaceContainerLowBrush" Color="#001C1E21" />
+            <SolidColorBrush x:Key="NlSurfaceContainerBrush" Color="#12FFFFFF" />
+            <SolidColorBrush x:Key="NlSurfaceContainerHighBrush" Color="#1EFFFFFF" />
+            <SolidColorBrush x:Key="NlSurfaceContainerHighestBrush" Color="#2CFFFFFF" />
+            <SolidColorBrush x:Key="NlFlyoutSurfaceBrush" Color="#E6202226" />
+            <SolidColorBrush x:Key="NlCardStrokeBrush" Color="#18FFFFFF" />
+            <SolidColorBrush x:Key="NlControlStrokeBrush" Color="#1AFFFFFF" />
+            <SolidColorBrush x:Key="NlOnSurfaceBrush" Color="#EEE5D9" />
+            <SolidColorBrush x:Key="NlOnSurfaceVariantBrush" Color="#C6BBAD" />
+            <SolidColorBrush x:Key="NlOutlineBrush" Color="#93887A" />
+            <SolidColorBrush x:Key="NlOutlineVariantBrush" Color="#4C4439" />
+            <SolidColorBrush x:Key="NlWarningBrush" Color="#F2C14E" />
+            <SolidColorBrush x:Key="NlErrorBrush" Color="#FFB4AB" />
+            <SolidColorBrush x:Key="NlOnErrorBrush" Color="#690005" />
+            <SolidColorBrush x:Key="NlScrimBrush" Color="#80000000" />
+
+            <!-- Remove default WinUI Button borders globally for clean borderless surfaces -->
+            <Thickness x:Key="ButtonBorderThemeThickness">0</Thickness>
+            <SolidColorBrush x:Key="ButtonBorderBrush" Color="Transparent" />
+            <SolidColorBrush x:Key="ButtonBorderBrushPointerOver" Color="Transparent" />
+            <SolidColorBrush x:Key="ButtonBorderBrushPressed" Color="Transparent" />
+            <SolidColorBrush x:Key="ToggleButtonBorderBrush" Color="Transparent" />
+            <SolidColorBrush x:Key="ToggleButtonBorderBrushPointerOver" Color="Transparent" />
+            <SolidColorBrush x:Key="ToggleButtonBorderBrushPressed" Color="Transparent" />
+            <SolidColorBrush x:Key="ToggleButtonBorderBrushChecked" Color="Transparent" />
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

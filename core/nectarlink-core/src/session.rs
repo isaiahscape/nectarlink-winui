@@ -1,0 +1,1259 @@
+// SPDX-License-Identifier: MPL-2.0
+//! One authenticated session with a paired device: the hello handshake, the
+//! control stream, request/response correlation and the heartbeat.
+
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use iroh::endpoint::{Connection, Path, PathEvent, PathEventStream, RecvStream, SendStream, VarInt};
+use nectarlink_protocol::{
+    DeviceId, Envelope, ErrorCode, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, ProtocolError, messages::*,
+    negotiate_version, read_frame, write_frame,
+};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+
+use crate::{
+    Error, Result,
+    error::Side,
+    events::{ConnectionPath, NodeEvent},
+    node::Shared,
+};
+
+#[path = "wake.rs"]
+pub(crate) mod wake;
+
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the round-trip time shown for a peer is brought up to date.
+/// A link that dropped is QUIC's to notice too (`IDLE_TIMEOUT` in node.rs).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// How often each side looks for a sign of life from the other. Packets that
+/// arrived since the last look, QUIC's keepalives included, are one, so a
+/// healthy link sends no pings of its own: those only added packets to what
+/// QUIC already sends. A window with nothing is probed with a ping, as
+/// before. It must be clearly longer than QUIC's keep-alive interval
+/// (`KEEP_ALIVE_INTERVAL` in node.rs): a keepalive comes a little after 5 s,
+/// and a window of exactly 5 s sometimes caught none and pinged for nothing.
+/// A peer that's gone is found in about 11.5 to 18.5 s (one silent window,
+/// then the 3 s ping and its 1.5 s retry), as before.
+const EVIDENCE_WINDOW: Duration = Duration::from_secs(7);
+const _: () = assert!(EVIDENCE_WINDOW.as_millis() >= crate::node::KEEP_ALIVE_INTERVAL.as_millis() + 2000);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(3000);
+const HEARTBEAT_RETRY_TIMEOUT: Duration = Duration::from_millis(1500);
+const OUTBOX_CAPACITY: usize = 256;
+
+/// QUIC close code used when a duplicate connection is dropped.
+pub(crate) const CLOSE_DUPLICATE: u32 = 100;
+/// QUIC close code for a normal shutdown.
+pub(crate) const CLOSE_NORMAL: u32 = 0;
+
+/// Returns true if `ip` is a local/private LAN or loopback address, or a
+/// Tailscale tailnet address (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`).
+/// Global internet addresses (public IPv4, `2000::/3`) are rejected.
+///
+/// Tailnet addresses count as local: Tailscale's WireGuard network is private
+/// to the user's devices, and it's how a PC is reached from another network
+/// without relays. Carrier CGNAT shares `100.64.0.0/10`, but a direct path
+/// still needs the paired device's key, and relays stay off.
+pub fn is_lan_ip(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_link_local()
+                || v4.is_loopback()
+                || is_tailnet_ip(std::net::IpAddr::V4(v4))
+        }
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unicast_link_local() || v6.is_unique_local(),
+    }
+}
+
+/// Returns true if `ip` reaches a peer on this network: a LAN address
+/// (`is_lan_ip`), or one the peer announced over mDNS here (`announced`).
+/// mDNS doesn't cross routers, so the second covers home networks numbered
+/// outside the private ranges (#131).
+pub(crate) fn is_lan_peer_ip(ip: std::net::IpAddr, announced: &[std::net::SocketAddr]) -> bool {
+    let ip = ip.to_canonical();
+    is_lan_ip(ip) || announced.iter().any(|a| a.ip().to_canonical() == ip)
+}
+
+/// Returns true if `ip` is in Tailscale's ranges: IPv4 `100.64.0.0/10` (the
+/// shared address space it assigns from) or IPv6 `fd7a:115c:a1e0::/48`.
+pub(crate) fn is_tailnet_ip(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            a == 100 && (b & 0xC0) == 64
+        }
+        std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            seg[0] == 0xfd7a && seg[1] == 0x115c && seg[2] == 0xa1e0
+        }
+    }
+}
+
+/// Returns true if `ip` is on a network of this place only: a private or link-local
+/// IPv4 address, a link-local or unique-local IPv6 one, or loopback. Unlike
+/// [`is_lan_ip`], tailnet addresses and carrier CGNAT (`100.64.0.0/10`) don't count:
+/// they reach a device anywhere, over mobile data too.
+pub(crate) fn is_private_lan_ip(ip: std::net::IpAddr) -> bool {
+    if is_tailnet_ip(ip) {
+        return false;
+    }
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unicast_link_local() || v6.is_unique_local(),
+    }
+}
+
+/// Returns true if `a` and `b` are on the same subnet as far as can be told without
+/// the interface's prefix: the same `/64` for IPv6, the same `/24` for IPv4.
+pub(crate) fn is_same_subnet(a: std::net::IpAddr, b: std::net::IpAddr) -> bool {
+    match (a.to_canonical(), b.to_canonical()) {
+        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => a.octets()[..3] == b.octets()[..3],
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => is_same_ipv6_subnet(a, b),
+        _ => false,
+    }
+}
+
+/// Returns true if two IPv6 addresses share the same `/64` subnet prefix.
+pub(crate) fn is_same_ipv6_subnet(a: std::net::Ipv6Addr, b: std::net::Ipv6Addr) -> bool {
+    a.segments()[..4] == b.segments()[..4]
+}
+
+/// Builds this device's hello from the shared local state.
+pub(crate) fn local_hello(shared: &Shared) -> Hello {
+    let local = shared.local.read().unwrap_or_else(|e| e.into_inner());
+    Hello {
+        proto: PROTOCOL_VERSION,
+        min: MIN_PROTOCOL_VERSION,
+        app: local.app_version.clone(),
+        device: local.device.clone(),
+        caps: local.capabilities(),
+        power: local.power,
+        // Public (LocalSend announces it), and only told to paired devices.
+        localsend: Some(shared.localsend.fingerprint().to_owned()),
+    }
+}
+
+/// Runs the dialer side of the handshake on a fresh connection.
+pub(crate) async fn handshake_dialer(
+    conn: &Connection,
+    hello: &Hello,
+) -> Result<(SendStream, RecvStream, Hello)> {
+    let run = async {
+        let (mut send, mut recv) = conn.open_bi().await.map_err(crate::error::net)?;
+        write_frame(&mut send, &Envelope::new(types::HELLO, hello)?.to_cbor()).await?;
+        let remote = read_hello(&mut recv).await?;
+        check_versions(conn, &mut send, hello, &remote).await?;
+        Ok((send, recv, remote))
+    };
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, run).await.map_err(|_| Error::Timeout)?
+}
+
+/// Runs the listener side of the handshake on an accepted connection.
+pub(crate) async fn handshake_listener(
+    conn: &Connection,
+    hello: &Hello,
+) -> Result<(SendStream, RecvStream, Hello)> {
+    let run = async {
+        let (mut send, mut recv) = conn.accept_bi().await.map_err(crate::error::net)?;
+        let remote = read_hello(&mut recv).await?;
+        check_versions(conn, &mut send, hello, &remote).await?;
+        write_frame(&mut send, &Envelope::new(types::HELLO, hello)?.to_cbor()).await?;
+        Ok((send, recv, remote))
+    };
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, run).await.map_err(|_| Error::Timeout)?
+}
+
+async fn read_hello(recv: &mut RecvStream) -> Result<Hello> {
+    let frame = read_frame(recv).await?.ok_or(Error::Offline)?;
+    Ok(Envelope::from_cbor(&frame)?.expect_body(types::HELLO)?)
+}
+
+async fn check_versions(
+    conn: &Connection,
+    send: &mut SendStream,
+    local: &Hello,
+    remote: &Hello,
+) -> Result<()> {
+    if negotiate_version((local.proto, local.min), (remote.proto, remote.min)).is_some() {
+        return Ok(());
+    }
+    // Tell the peer why before closing; best effort.
+    let msg = format!("protocol {} is not compatible with {}", remote.proto, local.proto);
+    let _ = write_frame(send, &Envelope::error(ErrorCode::VersionTooOld, msg).to_cbor()).await;
+    let side = if remote.proto < local.min { Side::Remote } else { Side::Local };
+    conn.close(VarInt::from_u32(ErrorCode::VersionTooOld.close_code()), b"version");
+    Err(Error::VersionTooOld { side })
+}
+
+/// A live session. Cheap to share; dropping the last handle does not close
+/// the connection (call [`Session::close`]).
+/// Runs a session's end once its task is over, normally or by a panic: cancels its
+/// work, fails the requests still waiting, then `on_end`.
+///
+/// A task dropped unfinished without a panic means the runtime is shutting down: then
+/// only its work is cancelled, since `on_end` starts more work, which can't run then.
+struct SessionEnd<F: FnOnce(Arc<Session>)> {
+    session: Option<Arc<Session>>,
+    on_end: Option<F>,
+    finished: bool,
+}
+
+impl<F: FnOnce(Arc<Session>)> Drop for SessionEnd<F> {
+    fn drop(&mut self) {
+        let (Some(s), Some(on_end)) = (self.session.take(), self.on_end.take()) else { return };
+        s.cancel.cancel();
+        // Fail any requests still waiting for a reply.
+        s.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let panicked = std::thread::panicking();
+        if !self.finished && !panicked {
+            return;
+        }
+        if panicked {
+            tracing::error!(peer = %s.peer.short(), "session ended by a panic");
+        } else {
+            tracing::debug!(peer = %s.peer.short(), "session ended");
+        }
+        on_end(s);
+    }
+}
+
+pub(crate) struct Session {
+    pub peer: DeviceId,
+    /// Who opened the connection; used to resolve duplicate connections.
+    pub dialer: DeviceId,
+    pub conn: Connection,
+    pub(crate) ring_command: tokio::sync::Mutex<()>,
+    outbox: mpsc::Sender<Envelope>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Envelope>>>,
+    next_id: AtomicU64,
+    rtt_ms: AtomicU32,
+    /// Heartbeat pings sent on this session ([`Node::heartbeat_pings`]).
+    pub(crate) heartbeat_pings: std::sync::atomic::AtomicU64,
+    pub(crate) started: Instant,
+    last_rx_ms: AtomicU64,
+    usb_bridge_ports: Arc<Mutex<HashMap<u16, DeviceId>>>,
+    usb_peers: Arc<Mutex<HashMap<DeviceId, (std::net::SocketAddr, CancellationToken)>>>,
+    /// Apps whose notification icon this peer already got.
+    sent_icons: crate::notifications::SentIcons,
+    /// Serializes media snapshots and remembers the artwork queued for this device.
+    pub(crate) sent_art: tokio::sync::Mutex<HashSet<String>>,
+    /// This peer asked for no notifications for now. Ends with the session: a
+    /// PC that's still locked says so again when it reconnects.
+    notifications_held: std::sync::atomic::AtomicBool,
+    shared: Weak<Shared>,
+    pub(crate) cancel: CancellationToken,
+}
+
+struct PendingReply<'a> {
+    session: &'a Session,
+    id: u64,
+    sent: bool,
+    cancel_unlock: bool,
+}
+
+impl Drop for PendingReply<'_> {
+    fn drop(&mut self) {
+        let unanswered = self.session.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+        if unanswered.is_some()
+            && self.sent
+            && self.cancel_unlock
+            && let Ok(cancel) = Envelope::new(types::LINUX_UNLOCK_CANCEL, &self.id)
+            && let Err(mpsc::error::TrySendError::Full(cancel)) = self.session.outbox.try_send(cancel)
+        {
+            let outbox = self.session.outbox.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = outbox.send(cancel).await;
+                });
+            } else {
+                self.session.close(CLOSE_NORMAL, b"phone unlock cancelled");
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("peer", &self.peer)
+            .field("dialer", &self.dialer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Session {
+    /// Starts the session's tasks. `on_end` runs once when the session ends,
+    /// for any reason.
+    pub(crate) fn spawn(
+        shared: &Arc<Shared>,
+        conn: Connection,
+        dialer: DeviceId,
+        (send, recv): (SendStream, RecvStream),
+        on_end: impl FnOnce(Arc<Session>) + Send + 'static,
+    ) -> Arc<Session> {
+        let peer = crate::device_id(&conn.remote_id());
+        // Start from QUIC's estimate (from the handshake) until the first
+        // heartbeat measures the round trip end to end.
+        let initial_rtt = conn
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map_or(0, |p| p.rtt().as_millis().min(u128::from(u32::MAX)) as u32);
+        // (`transport_rtt_ms` reads the same, once the session exists.)
+        let (outbox, outbox_rx) = mpsc::channel(OUTBOX_CAPACITY);
+        let session = Arc::new(Session {
+            peer,
+            dialer,
+            conn,
+            ring_command: Default::default(),
+            outbox,
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            rtt_ms: AtomicU32::new(initial_rtt),
+            heartbeat_pings: std::sync::atomic::AtomicU64::new(0),
+            started: Instant::now(),
+            last_rx_ms: AtomicU64::new(0),
+            usb_bridge_ports: shared.usb_bridge_ports.clone(),
+            usb_peers: shared.usb_peers.clone(),
+            sent_icons: Default::default(),
+            sent_art: Default::default(),
+            notifications_held: Default::default(),
+            shared: Arc::downgrade(shared),
+            cancel: shared.cancel.child_token(),
+        });
+
+        let weak = Arc::downgrade(shared);
+        let s = session.clone();
+        tokio::spawn(async move {
+            let cancel = s.cancel.clone();
+            // Ends the session however this task ends: normally, or by a panic in one of
+            // its parts, which would otherwise leave a dead session registered as live.
+            let mut end = SessionEnd { session: Some(s.clone()), on_end: Some(on_end), finished: false };
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = writer(send, outbox_rx) => {}
+                _ = reader(&s, recv, &weak) => {}
+                _ = heartbeat(&s, &weak) => {}
+                _ = watch_paths(&s, &weak) => {}
+                _ = streams(&s, &weak) => {}
+                _ = datagrams(&s, &weak) => {}
+                _ = s.conn.closed() => {}
+            }
+            end.finished = true;
+        });
+        session
+    }
+
+    pub fn rtt_ms(&self) -> u32 {
+        self.rtt_ms.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn touch_rx(&self) {
+        let elapsed = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        self.last_rx_ms.store(elapsed, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rx_since(&self, since: Instant) -> bool {
+        let since_ms = since
+            .checked_duration_since(self.started)
+            .map_or(0, |d| d.as_millis().min(u128::from(u64::MAX)) as u64);
+        self.last_rx_ms.load(Ordering::Relaxed) > since_ms
+    }
+
+    pub(crate) fn is_usb_addr(&self, addr: &std::net::SocketAddr) -> bool {
+        addr.ip().to_canonical().is_loopback()
+            && self.usb_bridge_ports.lock().unwrap_or_else(|e| e.into_inner()).get(&addr.port())
+                == Some(&self.peer)
+    }
+
+    fn has_usb_tunnel(&self) -> bool {
+        self.usb_peers.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&self.peer)
+    }
+
+    pub(crate) fn uses_usb_bridge_port(&self, port: u16) -> bool {
+        self.usb_peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.peer)
+            .is_some_and(|(addr, _)| addr.port() == port)
+            || self.conn.paths().iter().any(|p| {
+                matches!(
+                    p.remote_addr(),
+                    iroh::TransportAddr::Ip(addr) if addr.port() == port && self.is_usb_addr(addr)
+                )
+            })
+    }
+
+    pub(crate) fn relay_url(&self) -> Option<iroh::RelayUrl> {
+        if self.has_usb_tunnel() {
+            return None;
+        }
+        let paths = self.conn.paths();
+        let path = paths.iter().find(|p| p.is_selected()).or_else(|| paths.iter().next())?;
+        match path.remote_addr() {
+            iroh::TransportAddr::Relay(url) => Some(url.clone()),
+            _ => None,
+        }
+    }
+
+    /// Classifies a single QUIC path as USB, local network, or relay/WAN.
+    fn classify_path(&self, path: &Path) -> ConnectionPath {
+        if path.is_relay() {
+            return ConnectionPath::Relay;
+        }
+        match path.remote_addr() {
+            iroh::TransportAddr::Ip(addr) if self.is_usb_addr(addr) => ConnectionPath::Usb,
+            iroh::TransportAddr::Ip(addr) => {
+                let is_lan = self
+                    .shared
+                    .upgrade()
+                    .map_or_else(|| is_lan_ip(addr.ip()), |s| s.is_lan_peer_ip(&self.peer, addr.ip()));
+                if is_lan { ConnectionPath::Lan } else { ConnectionPath::Relay }
+            }
+            iroh::TransportAddr::Relay(_) => ConnectionPath::Relay,
+            _ => ConnectionPath::Lan,
+        }
+    }
+
+    /// The path the connection currently uses.
+    pub fn path(&self) -> ConnectionPath {
+        if self.has_usb_tunnel() {
+            return ConnectionPath::Usb;
+        }
+        let paths = self.conn.paths();
+        let selected = paths.iter().find(|p| p.is_selected()).or_else(|| paths.iter().next());
+        match selected {
+            Some(p) => self.classify_path(&p),
+            None => {
+                if paths.iter().any(
+                    |p| matches!(p.remote_addr(), iroh::TransportAddr::Ip(addr) if self.is_usb_addr(addr)),
+                ) {
+                    ConnectionPath::Usb
+                } else {
+                    ConnectionPath::Relay
+                }
+            }
+        }
+    }
+
+    /// The address of the path the connection uses now, when that's a direct IP path
+    /// (not a relay, not the USB tunnel). `None` while no path is selected.
+    pub(crate) fn selected_direct_addr(&self) -> Option<std::net::SocketAddr> {
+        self.selected_ip_path().filter(|(_, usb)| !usb).map(|(addr, _)| addr)
+    }
+
+    /// The selected direct address and whether it belongs to this peer's USB bridge.
+    pub(crate) fn selected_ip_path(&self) -> Option<(std::net::SocketAddr, bool)> {
+        let paths = self.conn.paths();
+        let selected = paths.iter().find(|p| p.is_selected())?;
+        let addr = direct_ip_addr(selected.remote_addr())?;
+        Some((addr, self.is_usb_addr(&addr)))
+    }
+
+    pub(crate) fn path_events(&self) -> PathEventStream {
+        self.conn.path_events()
+    }
+
+    /// The peer's direct IP addresses currently in use, for reconnecting later.
+    pub fn remote_ip_addrs(&self) -> Vec<std::net::SocketAddr> {
+        self.conn
+            .paths()
+            .iter()
+            .filter_map(|p| match p.remote_addr() {
+                iroh::TransportAddr::Ip(addr) if !self.is_usb_addr(addr) && !addr.ip().is_loopback() => {
+                    Some(*addr)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn sent_icons(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
+        self.sent_icons.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn notifications_held(&self) -> bool {
+        self.notifications_held.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn hold_notifications(&self, held: bool) {
+        self.notifications_held.store(held, Ordering::Relaxed);
+    }
+
+    pub fn is_alive(&self) -> bool {
+        !self.cancel.is_cancelled() && self.conn.close_reason().is_none()
+    }
+
+    /// Sends a QUIC datagram (protocol v0 §4).
+    pub fn send_datagram(&self, data: bytes::Bytes) -> Result<()> {
+        self.conn.send_datagram(data).map_err(crate::error::net)
+    }
+
+    /// Opens a bidirectional stream on the session connection.
+    pub async fn open_bi(&self) -> Result<(SendStream, RecvStream)> {
+        self.conn.open_bi().await.map_err(crate::error::net)
+    }
+
+    /// Queues a one-way message.
+    pub async fn send(&self, env: Envelope) -> Result<()> {
+        self.outbox.send(env).await.map_err(|_| Error::Offline)
+    }
+
+    /// Best-effort non-blocking enqueue for loss-tolerant real-time media frames
+    /// (such as live PCM audio fallback).
+    ///
+    /// Returns `Ok(())` even when a frame is dropped because the outbox is past half
+    /// capacity or full, so real-time media never fills the control stream outbox and
+    /// starves heartbeats or RPCs. Do not use this for messages that must arrive.
+    pub fn try_send_realtime(&self, env: Envelope) -> Result<()> {
+        if self.outbox.capacity() <= OUTBOX_CAPACITY / 2 {
+            return Ok(());
+        }
+        match self.outbox.try_send(env) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Offline),
+        }
+    }
+
+    /// Sends a request and waits for the reply with the matching `re`.
+    pub async fn request(&self, env: Envelope, timeout: Duration) -> Result<Envelope> {
+        self.request_tracked(env, timeout).await.0
+    }
+
+    /// Like [`request`](Self::request), and also says whether the request was
+    /// sent. A request that went out may have run on the peer even if no
+    /// reply came back, so only an unsent one is safe to send again.
+    pub async fn request_tracked(&self, env: Envelope, timeout: Duration) -> (Result<Envelope>, bool) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(id, tx);
+        let cancel_unlock = matches!(env.t.as_str(), types::LINUX_UNLOCK_ENROLL | types::LINUX_UNLOCK_SIGN);
+        let mut pending = PendingReply { session: self, id, sent: false, cancel_unlock };
+        let result = match tokio::time::timeout(timeout, async {
+            self.send(env.with_id(id)).await?;
+            pending.sent = true;
+            rx.await.map_err(|_| Error::Offline)
+        })
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_) => Err(Error::Timeout),
+        };
+        (result, pending.sent)
+    }
+
+    /// Closes the connection with an application code.
+    pub fn close(&self, code: u32, reason: &[u8]) {
+        self.conn.close(VarInt::from_u32(code), reason);
+        self.cancel.cancel();
+    }
+
+    fn complete(&self, env: Envelope) -> std::result::Result<(), Envelope> {
+        let Some(re) = env.re else { return Err(env) };
+        match self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&re) {
+            Some(tx) => {
+                let _ = tx.send(env);
+                Ok(())
+            }
+            None => Err(env),
+        }
+    }
+}
+
+/// Whether `mac` is the Wake-on-LAN address of a PC paired with this device.
+/// 16-bit PCM the player can take: a sane rate, mono or stereo, and whole
+/// frames. A rate or layout out of range would play at the wrong speed, and
+/// a ragged length makes a misaligned write to the audio device.
+fn pcm_frame_ok(sample_rate: u32, channels: u8, len: usize) -> bool {
+    (8_000..=96_000).contains(&sample_rate)
+        && (1..=2).contains(&channels)
+        && len > 0
+        && len.is_multiple_of(2 * usize::from(channels))
+}
+
+/// The wake info a paired PC gave with `mac` among its addresses, if any.
+fn known_wake_info(shared: &Shared, mac: &[u8; 6]) -> Option<nectarlink_protocol::messages::PcWakeInfo> {
+    let mac = nectarlink_protocol::messages::format_mac(mac);
+    shared
+        .store
+        .list_peers()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|p| p.wake_info)
+        .find(|w| w.macs.iter().any(|m| m.eq_ignore_ascii_case(&mac)))
+}
+
+/// The control stream goes out before media streams ([`crate::mirror`]):
+/// with a few app windows filling the link, heartbeats queued behind video
+/// timed out and closed a live session.
+const CONTROL_PRIORITY: i32 = 8;
+const _: () = assert!(
+    CONTROL_PRIORITY > crate::mirror::AUDIO_PRIORITY && CONTROL_PRIORITY > crate::mirror::VIDEO_PRIORITY
+);
+
+async fn writer(mut send: SendStream, mut outbox: mpsc::Receiver<Envelope>) {
+    let _ = send.set_priority(CONTROL_PRIORITY);
+    while let Some(env) = outbox.recv().await {
+        if let Err(e) = write_frame(&mut send, &env.to_cbor()).await {
+            tracing::debug!(error = %e, "control stream write failed");
+            return;
+        }
+    }
+    let _ = send.finish();
+}
+
+fn direct_ip_addr(addr: &iroh::TransportAddr) -> Option<std::net::SocketAddr> {
+    match addr {
+        iroh::TransportAddr::Ip(addr) => Some(*addr),
+        _ => None,
+    }
+}
+
+async fn reader(session: &Arc<Session>, mut recv: RecvStream, shared: &Weak<Shared>) {
+    let background = Arc::new(tokio::sync::Semaphore::new(MAX_BACKGROUND_RPCS));
+    let unlock_cleanup = Arc::new(tokio::sync::Semaphore::new(1));
+    loop {
+        let frame = match read_frame(&mut recv).await {
+            Ok(Some(frame)) => {
+                session.touch_rx();
+                frame
+            }
+            Ok(None) => return,
+            Err(ProtocolError::FrameTooLarge(len)) => {
+                tracing::warn!(peer = %session.peer.short(), len, "peer sent an oversized frame");
+                session.close(ErrorCode::FrameTooLarge.close_code(), b"frame too large");
+                return;
+            }
+            Err(e) => {
+                tracing::debug!(peer = %session.peer.short(), error = %e, "control stream read failed");
+                return;
+            }
+        };
+        let env = match Envelope::from_cbor(&frame) {
+            Ok(env) => env,
+            Err(e) => {
+                tracing::warn!(peer = %session.peer.short(), error = %e, "dropping malformed message");
+                continue;
+            }
+        };
+        let env = if env.re.is_some() {
+            match session.complete(env) {
+                Ok(()) => continue,
+                Err(env) => env,
+            }
+        } else {
+            env
+        };
+        let Some(shared) = shared.upgrade() else { return };
+        if is_background_rpc(&env.t) {
+            // Waiting for a slot would hold up heartbeats behind slow
+            // requests, so past the limit a request is turned away instead.
+            // An opt-out must reach the phone even when unrelated background requests are full.
+            let permits =
+                if env.t == types::LINUX_UNLOCK_FORGET && matches!(env.body(), Ok(LinuxUnlockForget::All)) {
+                    &unlock_cleanup
+                } else {
+                    &background
+                };
+            let Ok(permit) = permits.clone().try_acquire_owned() else {
+                tracing::warn!(peer = %session.peer.short(), t = %env.t, "too many requests at once");
+                if env.id.is_some() {
+                    let reply = Envelope::error(ErrorCode::Busy, "too many requests at once");
+                    let _ = session.send(reply.reply_to(env.id)).await;
+                }
+                continue;
+            };
+            let unlock = match crate::linux_unlock::prepare_background(&shared, session, &env) {
+                Ok(unlock) => unlock,
+                Err(reply) => {
+                    let _ = session.send(reply.reply_to(env.id)).await;
+                    continue;
+                }
+            };
+            let session = session.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle(&shared, &session, env, unlock).await {
+                    tracing::warn!(peer = %session.peer.short(), error = %e, "failed to handle message");
+                }
+                drop(permit);
+            });
+        } else if let Err(e) = handle(&shared, session, env, None).await {
+            tracing::warn!(peer = %session.peer.short(), error = %e, "failed to handle message");
+        }
+    }
+}
+
+/// Requests that can take a while (the phone's user or apps, a whole photo
+/// to send) run on a task of their own so they never stall the control
+/// stream (heartbeats, and other messages). Ones whose order matters
+/// (clipboard, media and call commands: pause after play, unmute after
+/// mute) stay in order on the stream.
+fn is_background_rpc(t: &str) -> bool {
+    matches!(
+        t,
+        types::NOTIFY_DISMISS
+            | types::NOTIFY_ACTION
+            | types::PC_POWER
+            | types::LINK_OPEN
+            | types::PHOTOS_ALBUMS
+            | types::PHOTOS_LIST
+            | types::PHOTOS_THUMBS
+            | types::PHOTOS_GET
+            | types::CALL_LOG
+            | types::CONTACTS_LIST
+            | types::SMS_THREADS
+            | types::SMS_MESSAGES
+            | types::SMS_SEND
+            | types::SMS_PART
+            | types::MIRROR_START
+            | types::MIRROR_APPS
+            | types::WEBCAM_START
+            | types::CAMERA_CAPTURE_REQUEST
+            | types::STORAGE_LIST
+            | types::STORAGE_MKDIR
+            | types::STORAGE_RENAME
+            | types::STORAGE_DELETE
+            | types::WAKE_RELAY
+            // The phone's owner answers a biometric prompt.
+            | types::UNLOCK_ENROLL
+            | types::UNLOCK_REQUEST
+            | types::LINUX_UNLOCK_ENROLL
+            | types::LINUX_UNLOCK_SIGN
+            | types::LINUX_UNLOCK_FORGET
+    )
+}
+
+/// Handles one incoming message that isn't a reply.
+async fn handle(
+    shared: &Arc<Shared>,
+    session: &Arc<Session>,
+    env: Envelope,
+    unlock: Option<crate::linux_unlock::Incoming>,
+) -> Result<()> {
+    let peer = session.peer;
+    match env.t.as_str() {
+        types::PING => {
+            let ping: Ping = env.body()?;
+            session.send(Envelope::new(types::PONG, &ping)?.reply_to(env.id)).await?;
+        }
+        types::EVENT_BATTERY => {
+            let battery = env.body::<Battery>()?.sanitized();
+            shared.emit(NodeEvent::Battery { device: peer, battery });
+        }
+        types::EVENT_UPDATE => {
+            let hint = env.body::<nectarlink_protocol::messages::UpdateHint>()?;
+            match hint.sanitized() {
+                Some(hint) => shared.emit(NodeEvent::UpdateHint {
+                    device: peer,
+                    channel: hint.channel,
+                    version: hint.version,
+                }),
+                None => tracing::debug!(peer = %peer.short(), "ignored a malformed update hint"),
+            }
+        }
+        types::EVENT_DEVICE => {
+            let info = env.body::<DeviceInfo>()?.sanitized();
+            shared.store.update_info(&peer, &info)?;
+            let effective = shared.store.get_peer(&peer).ok().flatten().map(|p| p.info).unwrap_or(info);
+            shared.emit(NodeEvent::PeerInfoChanged { device: peer, info: effective });
+        }
+        types::HELLO_UPDATE => {
+            let update: HelloUpdate = env.body()?;
+            if let Some(info) = update.device.map(DeviceInfo::sanitized) {
+                shared.store.update_info(&peer, &info)?;
+                let effective = shared.store.get_peer(&peer).ok().flatten().map(|p| p.info).unwrap_or(info);
+                shared.emit(NodeEvent::PeerInfoChanged { device: peer, info: effective });
+            }
+            let caps = update.caps.map(crate::features::sanitize_capabilities);
+            let power = update.power.map(PowerLevel::effective);
+            let had_caps = caps.is_some();
+            if caps.is_some() || power.is_some() {
+                shared.store.update_capabilities(&peer, caps.as_ref(), power)?;
+            }
+            if let Some(power) = power {
+                shared.emit(NodeEvent::PeerPowerChanged { device: peer, power });
+            }
+            shared.refresh_capabilities(&peer);
+            if had_caps {
+                shared.send_toggles_state(session).await;
+            }
+        }
+        types::DEVICE_RING => {
+            let ring: Ring = env.body()?;
+            shared.receive_ring(session, ring).await;
+            session.send(Envelope::empty(types::OK).reply_to(env.id)).await?;
+        }
+        types::DEVICE_RING_STOPPED => {
+            let stopped: RingStopped = env.body()?;
+            shared.clear_remote_ring(peer, Some(stopped.token));
+        }
+        types::PAIR_REVOKE => {
+            tracing::info!(peer = %peer.short(), "peer unpaired this device");
+            // Forgetting the peer closes this session before its cleanup finishes.
+            // Keep the cleanup alive when closing the session drops the reader.
+            let shared = shared.clone();
+            tokio::spawn(async move { shared.forget_peer(&peer).await })
+                .await
+                .map_err(|err| Error::Internal(err.to_string()))??;
+        }
+        t if t.starts_with("notify.") && crate::notifications::handle(shared, session, &env).await? => {}
+        t if t.starts_with("media.") && crate::media::handle(shared, session, &env).await? => {}
+        t if (t.starts_with("pc.") || t.starts_with("link.") || t.starts_with("task."))
+            && crate::actions::handle(shared, session, &env).await? => {}
+        t if t.starts_with("clip.") && crate::clipboard::handle(shared, session, &env).await? => {}
+        t if t.starts_with("photos.") && crate::photos::handle(shared, session, &env).await? => {}
+        t if t.starts_with("call.audio.") && crate::call_audio::handle(shared, session, &env).await? => {}
+        t if t.starts_with("call.") && crate::calls::handle(shared, session, &env).await? => {}
+        t if t.starts_with("contacts.") && crate::contacts::handle(shared, session, &env).await? => {}
+        t if t.starts_with("sms.") && crate::sms::handle(shared, session, &env).await? => {}
+        t if (t.starts_with("mirror.") || t.starts_with("pointer."))
+            && crate::mirror::handle(shared, session, &env).await? => {}
+        t if t.starts_with("webcam.") && crate::webcam::handle(shared, session, &env).await? => {}
+        t if t.starts_with("mic.") && crate::mic::handle(shared, session, &env).await? => {}
+        t if t.starts_with("diag.") && crate::diag_ask::handle(shared, session, &env).await? => {}
+        t if t.starts_with("elevated.usb") && crate::elevated_usb::handle(shared, session, &env).await? => {}
+        t if t.starts_with("camera.capture.")
+            && crate::continuity_camera::handle(shared, session, &env).await? => {}
+        t if t.starts_with("remote.") && crate::remote::handle(shared, session, &env).await? => {}
+        t if t.starts_with("phone.toggle") && crate::toggles::handle(shared, session, &env).await? => {}
+        t if (t.starts_with("deck.") || t == types::PC_AUDIO_SET)
+            && crate::deck::handle(shared, session, &env).await? => {}
+        t if t.starts_with("storage.") && crate::storage::handle(shared, session, &env).await? => {}
+        t if t.starts_with("unlock.linux.v1.")
+            && crate::linux_unlock::handle(shared, session, &env, unlock).await? => {}
+        t if t.starts_with("unlock.") && crate::unlock::handle(shared, session, &env).await? => {}
+        t if (t == types::FILES_RESUME || t == types::FILES_CANCEL)
+            && crate::transfer::handle_control(shared, peer, &env).await? => {}
+        types::WAKE_RELAY => {
+            let req = env.body::<WakeRelay>().ok();
+            let shared_clone = shared.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                // Only for a PC paired with this device, by an address it gave as its own.
+                let info = req.as_ref().and_then(|r| known_wake_info(&shared_clone, &r.mac));
+                let (Some(req), Some(info)) = (req, info) else { return Err(ErrorCode::Denied) };
+                // Only to a subnet that PC gave as its own; anything else goes
+                // to this network's broadcast, never to an address a peer picks.
+                let bcast = req
+                    .broadcast
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|b| info.broadcasts.iter().any(|own| own.trim() == *b))
+                    .and_then(|b| b.parse().ok());
+                wake::send_magic_packet(req.mac, bcast).map_err(|_| ErrorCode::Internal)
+            })
+            .await
+            .unwrap_or(Err(ErrorCode::Internal));
+            if matches!(&result, Err(ErrorCode::Denied)) {
+                tracing::debug!(peer = %peer.short(), "refusing to wake an address no paired PC gave");
+            } else if result.is_err() {
+                tracing::debug!("couldn't send Wake-on-LAN packet");
+            }
+            if env.id.is_some() {
+                let reply = match result {
+                    Ok(()) => Envelope::empty(types::OK),
+                    Err(ErrorCode::Denied) => {
+                        Envelope::error(ErrorCode::Denied, "not a paired PC's wake address")
+                    }
+                    Err(code) => Envelope::error(code, "couldn't send Wake-on-LAN packet"),
+                };
+                session.send(reply.reply_to(env.id)).await?;
+            }
+        }
+        types::AUDIO_PCM => {
+            // A rate or layout out of range would play at the wrong speed: dropped.
+            if shared.toggle_on(&peer, crate::media::TOGGLE)
+                && let Ok(frame) = env.body::<AudioPcmFrame>()
+                && pcm_frame_ok(frame.sample_rate, frame.channels, frame.pcm.len())
+            {
+                shared.emit(NodeEvent::PcAudioFrame {
+                    device: peer,
+                    sample_rate: frame.sample_rate,
+                    channels: frame.channels,
+                    pcm: frame.pcm,
+                });
+            }
+        }
+        other => {
+            if env.id.is_some() {
+                let reply = Envelope::error(ErrorCode::Unsupported, format!("unknown message type {other}"));
+                session.send(reply.reply_to(env.id)).await?;
+            }
+            // Unknown one-way messages are ignored (forward compatibility).
+        }
+    }
+    Ok(())
+}
+
+/// Background requests one peer may have running at a time.
+const MAX_BACKGROUND_RPCS: usize = 32;
+
+/// Concurrent incoming data streams allowed from one peer at a time.
+const MAX_INCOMING_STREAMS: usize = 32;
+
+/// Streams the other device opens (file transfers), each handled on its own.
+async fn streams(session: &Arc<Session>, shared: &Weak<Shared>) {
+    let limit = Arc::new(tokio::sync::Semaphore::new(MAX_INCOMING_STREAMS));
+    while let Ok((send, recv)) = session.conn.accept_bi().await {
+        session.touch_rx();
+        let Some(shared) = shared.upgrade() else { return };
+        let Ok(permit) = limit.clone().acquire_owned().await else { return };
+        let session = session.clone();
+        tokio::spawn(async move {
+            crate::transfer::accept_stream(shared, session, send, recv).await;
+            drop(permit);
+        });
+    }
+}
+
+async fn datagrams(session: &Arc<Session>, shared: &Weak<Shared>) {
+    loop {
+        match session.conn.read_datagram().await {
+            Ok(bytes) => {
+                session.touch_rx();
+                let Some(shared) = shared.upgrade() else { return };
+                if bytes.len() > 10 && &bytes[0..4] == b"NLPA" {
+                    let sample_rate = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+                    let channels = bytes[8];
+                    let pcm = bytes[10..].to_vec();
+                    if shared.toggle_on(&session.peer, crate::media::TOGGLE)
+                        && pcm_frame_ok(sample_rate, channels, pcm.len())
+                    {
+                        shared.emit(NodeEvent::PcAudioFrame {
+                            device: session.peer,
+                            sample_rate,
+                            channels,
+                            pcm,
+                        });
+                    }
+                } else {
+                    crate::remote::handle_datagram(&shared, session.peer, &bytes);
+                }
+            }
+            Err(_) => {
+                // If datagrams aren't available on this connection, stay parked
+                // until the session ends rather than tearing it down.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+pub(crate) async fn probe_after_network_change(shared: &Arc<Shared>, session: &Arc<Session>) {
+    if !session.is_alive() {
+        return;
+    }
+    if !shared.is_connection_allowed(&session.conn) {
+        tracing::info!(peer = %session.peer.short(), "closing non-LAN session after network change");
+        session.close(CLOSE_NORMAL, b"away mode disabled");
+        return;
+    }
+    let probe_start = Instant::now();
+    let Ok(ping) = Envelope::new(types::PING, &Ping { ts: 0 }) else { return };
+    if session.request(ping, Duration::from_millis(2000)).await.is_err() && !session.rx_since(probe_start) {
+        tracing::info!(peer = %session.peer.short(), "closing unreachable session after network change");
+        session.close(CLOSE_NORMAL, b"network lost");
+        return;
+    }
+    if let Some(rtt) = transport_rtt_ms(session) {
+        session.rtt_ms.store(rtt, Ordering::Relaxed);
+    }
+    shared.publish_online(session);
+}
+
+/// Publishes path switches (e.g. relay <-> direct LAN) and refreshed RTT right away
+/// instead of waiting for the next periodic heartbeat tick.
+async fn watch_paths(session: &Arc<Session>, shared: &Weak<Shared>) {
+    use n0_future::StreamExt;
+    let mut events = session.path_events();
+    let mut last_path = session.path();
+    while let Some(event) = events.next().await {
+        match event {
+            PathEvent::Selected { .. } | PathEvent::Lagged { .. } => {
+                if let Some(rtt) = transport_rtt_ms(session) {
+                    session.rtt_ms.store(rtt, Ordering::Relaxed);
+                }
+                let next_path = session.path();
+                if let Some(shared_arc) = shared.upgrade() {
+                    if next_path != last_path {
+                        tracing::info!(
+                            peer = %session.peer.short(),
+                            from = ?last_path,
+                            to = ?next_path,
+                            rtt_ms = session.rtt_ms(),
+                            "session path switched"
+                        );
+                        last_path = next_path;
+                    }
+                    shared_arc.publish_online(session);
+                }
+            }
+            PathEvent::Opened { .. } | PathEvent::Closed { .. } | _ => {}
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+async fn heartbeat(session: &Arc<Session>, shared: &Weak<Shared>) {
+    let started = Instant::now();
+    let mut interval = tokio::time::interval(EVIDENCE_WINDOW);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let rtt_every = (HEARTBEAT_INTERVAL.as_millis() / EVIDENCE_WINDOW.as_millis()).max(1) as u64;
+    let mut ticks: u64 = 0;
+    let mut last_received = received_bytes(session);
+    loop {
+        interval.tick().await;
+        ticks += 1;
+        // Every look: a session that moved off the LAN while that isn't
+        // allowed closes, whether or not anything is sent.
+        if let Some(shared_arc) = shared.upgrade()
+            && !shared_arc.is_connection_allowed(&session.conn)
+        {
+            tracing::info!(peer = %session.peer.short(), "closing session on disallowed non-LAN path");
+            session.close(CLOSE_NORMAL, b"away mode disabled");
+            return;
+        }
+        let received = received_bytes(session);
+        // The first look checks the new session end to end; after that, the
+        // peer's packets arriving are enough, and only silence is probed.
+        let alive_on_its_own = ticks > 1 && received > last_received;
+        last_received = received;
+        if alive_on_its_own {
+            if ticks.is_multiple_of(rtt_every)
+                && let Some(rtt) = transport_rtt_ms(session)
+            {
+                set_rtt(session, shared, rtt);
+            }
+            continue;
+        }
+        if !probe(session, shared, started).await {
+            return;
+        }
+        last_received = received_bytes(session);
+    }
+}
+
+/// Pings the peer, and once more if no answer came. Returns false after
+/// closing a session that's gone: no answer and nothing at all arrived.
+async fn probe(session: &Arc<Session>, shared: &Weak<Shared>, started: Instant) -> bool {
+    let sent_at = Instant::now();
+    let received = received_bytes(session);
+    let ts = sent_at.duration_since(started).as_millis() as u64;
+    let Ok(ping) = Envelope::new(types::PING, &Ping { ts }) else { return true };
+    session.heartbeat_pings.fetch_add(1, Ordering::Relaxed);
+    match session.request(ping, HEARTBEAT_TIMEOUT).await {
+        Ok(reply) if reply.t == types::PONG => {
+            // Prefer QUIC's actual transport RTT (just updated by the PING/PONG ACK)
+            // over app-layer stream elapsed time, which includes remote wake/dispatch latency.
+            let rtt = transport_rtt_ms(session)
+                .unwrap_or_else(|| sent_at.elapsed().as_millis().min(u32::MAX as u128) as u32);
+            set_rtt(session, shared, rtt);
+            true
+        }
+        Ok(_) => true,
+        Err(_) if session.rx_since(sent_at) => true,
+        // No answer, but the peer's packets are arriving: a slow link is full
+        // of what's being sent, and the answer is queued behind it.
+        Err(_) if received_bytes(session) > received => true,
+        Err(e) => {
+            // Retry once; if still unreachable and no frames arrived, close.
+            let retry_ts = started.elapsed().as_millis() as u64;
+            let alive = if let Ok(retry_ping) = Envelope::new(types::PING, &Ping { ts: retry_ts }) {
+                matches!(session.request(retry_ping, HEARTBEAT_RETRY_TIMEOUT).await, Ok(r) if r.t == types::PONG)
+                    || session.rx_since(sent_at)
+            } else {
+                session.rx_since(sent_at)
+            };
+            if !alive && received_bytes(session) <= received {
+                tracing::info!(peer = %session.peer.short(), error = %e, "heartbeat timed out; closing dead session");
+                session.close(CLOSE_NORMAL, b"heartbeat timeout");
+                return false;
+            }
+            true
+        }
+    }
+}
+
+/// Returns true when an RTT change should be pushed to listeners.
+fn should_publish_rtt(previous: u32, next: u32) -> bool {
+    previous.abs_diff(next) >= 2
+}
+
+/// Keeps the round-trip time, and tells the app when it moved by 2 ms or more.
+fn set_rtt(session: &Arc<Session>, shared: &Weak<Shared>, rtt: u32) {
+    let previous = session.rtt_ms.swap(rtt, Ordering::Relaxed);
+    if should_publish_rtt(previous, rtt)
+        && let Some(shared_arc) = shared.upgrade()
+    {
+        shared_arc.publish_online(session);
+    }
+}
+
+/// QUIC's smoothed round-trip time on the path in use, end to end over the
+/// relay too, refreshed by every acknowledgement (keepalives included).
+fn transport_rtt_ms(session: &Session) -> Option<u32> {
+    session
+        .conn
+        .paths()
+        .iter()
+        .find(|p| p.is_selected())
+        .map(|p| p.rtt().as_millis().min(u128::from(u32::MAX)) as u32)
+}
+
+/// All that has arrived on this connection, acknowledgements included:
+/// nothing does from a peer that's gone.
+fn received_bytes(session: &Session) -> u64 {
+    session.conn.stats().udp_rx.bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_lan_ip, is_lan_peer_ip, is_private_lan_ip, is_same_ipv6_subnet, is_same_subnet, is_tailnet_ip,
+        pcm_frame_ok,
+    };
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn a_relay_address_is_not_a_direct_path_for_phone_unlock() {
+        let relay = iroh::TransportAddr::Relay("https://relay.example/".parse().unwrap());
+        assert_eq!(super::direct_ip_addr(&relay), None);
+    }
+
+    #[test]
+    fn private_lan_ip_leaves_out_tailnet_cgnat_and_wan() {
+        for ok in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.9",
+            "192.168.1.20",
+            "169.254.3.4",
+            "::1",
+            "fe80::1",
+            "fd00::5",
+        ] {
+            assert!(is_private_lan_ip(ok.parse().unwrap()), "expected {ok} to be private");
+        }
+        for no in [
+            "100.64.0.1",
+            "100.100.100.100",
+            "100.127.255.254",
+            "fd7a:115c:a1e0::1",
+            "8.8.8.8",
+            "2001:4860::8888",
+            "::ffff:100.64.0.1",
+        ] {
+            assert!(!is_private_lan_ip(no.parse().unwrap()), "expected {no} not to be private");
+        }
+        assert!(is_private_lan_ip("::ffff:192.168.1.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn same_subnet_compares_v4_24_and_v6_64() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(is_same_subnet(ip("203.0.113.5"), ip("203.0.113.200")));
+        assert!(!is_same_subnet(ip("203.0.113.5"), ip("203.0.114.5")));
+        assert!(is_same_subnet(ip("2001:db8:1:2::a"), ip("2001:db8:1:2:ffff::1")));
+        assert!(!is_same_subnet(ip("2001:db8:1:2::a"), ip("2001:db8:1:3::a")));
+        assert!(is_same_subnet(ip("::ffff:203.0.113.5"), ip("203.0.113.9")));
+        assert!(!is_same_subnet(ip("203.0.113.5"), ip("2001:db8::1")));
+    }
+
+    #[test]
+    fn lan_ip_accepts_private_local_and_tailnet_and_rejects_wan() {
+        for ok in [
+            "127.0.0.1",
+            "192.168.1.42",
+            "10.0.0.15",
+            "172.16.5.2",
+            "169.254.10.20",
+            "::1",
+            "fe80::1234",
+            "fd12:3456:789a::1",
+            "100.64.0.1",
+            "100.101.102.103",
+            "100.127.255.254",
+            "fd7a:115c:a1e0::1",
+        ] {
+            let ip: IpAddr = ok.parse().unwrap();
+            assert!(is_lan_ip(ip), "expected {ok} to be treated as LAN IP");
+        }
+
+        for bad in
+            ["8.8.8.8", "100.63.255.255", "100.128.0.1", "2001:4860:4860::8888", "2401:4900:1c2a:8b00::1"]
+        {
+            let ip: IpAddr = bad.parse().unwrap();
+            assert!(!is_lan_ip(ip), "expected {bad} to be rejected as non-LAN IP");
+        }
+    }
+
+    #[test]
+    fn a_public_address_the_peer_announced_over_mdns_counts_as_lan() {
+        let announced: Vec<SocketAddr> = vec!["192.1.1.208:49806".parse().unwrap()];
+        // The peer's own address, on any port and IPv4-mapped too.
+        for ok in ["192.1.1.208", "::ffff:192.1.1.208"] {
+            assert!(is_lan_peer_ip(ok.parse().unwrap(), &announced), "expected {ok} to be LAN");
+        }
+        // Private addresses need no announcement.
+        assert!(is_lan_peer_ip("192.168.1.42".parse().unwrap(), &[]));
+        // Other public addresses, even next to it, stay out.
+        for bad in ["192.1.1.209", "8.8.8.8", "2001:4860:4860::8888"] {
+            assert!(!is_lan_peer_ip(bad.parse().unwrap(), &announced), "expected {bad} not to be LAN");
+        }
+        assert!(!is_lan_peer_ip("192.1.1.208".parse().unwrap(), &[]));
+    }
+
+    #[test]
+    fn tailnet_ip_matches_only_tailscale_ranges() {
+        for ok in [
+            "100.64.0.0",
+            "100.100.100.100",
+            "100.127.255.255",
+            "fd7a:115c:a1e0:ab12::1",
+            "::ffff:100.64.1.2",
+        ] {
+            assert!(is_tailnet_ip(ok.parse().unwrap()), "expected {ok} to be a tailnet IP");
+        }
+        for bad in ["100.63.0.1", "100.128.0.1", "192.168.1.1", "fd7a:115c:a1e1::1", "fd12::1"] {
+            assert!(!is_tailnet_ip(bad.parse().unwrap()), "expected {bad} not to be a tailnet IP");
+        }
+    }
+
+    #[test]
+    fn ipv6_same_subnet_matches_dual_stack_router_prefix_and_rejects_cellular() {
+        let pc_wifi: Ipv6Addr = "2001:db8:2042:8b43:894c:6df4:ca1c:7561".parse().unwrap();
+        let phone_wifi: Ipv6Addr = "2001:db8:2042:8b43:a9eb:bf3f:78e8:35bf".parse().unwrap();
+        let phone_lte: Ipv6Addr = "2001:db8:1c2a:9911:1122:3344:5566:7788".parse().unwrap();
+        assert!(is_same_ipv6_subnet(pc_wifi, phone_wifi));
+        assert!(!is_same_ipv6_subnet(pc_wifi, phone_lte));
+    }
+
+    #[test]
+    fn pc_audio_frames_must_be_whole_16_bit_frames_at_a_sane_rate() {
+        assert!(pcm_frame_ok(48_000, 2, 960));
+        assert!(pcm_frame_ok(8_000, 1, 2));
+        assert!(!pcm_frame_ok(48_000, 2, 962), "half a stereo frame");
+        assert!(!pcm_frame_ok(48_000, 1, 3), "half a sample");
+        assert!(!pcm_frame_ok(48_000, 2, 0));
+        assert!(!pcm_frame_ok(7_999, 1, 2));
+        assert!(!pcm_frame_ok(4_000_000_000, 2, 4));
+        assert!(!pcm_frame_ok(48_000, 3, 6));
+        assert!(!pcm_frame_ok(48_000, 0, 4));
+    }
+
+    #[test]
+    fn rtt_updates_publish_for_small_lan_changes() {
+        assert!(!super::should_publish_rtt(2, 3));
+        assert!(super::should_publish_rtt(6, 2));
+        assert!(super::should_publish_rtt(17, 15));
+        assert!(super::should_publish_rtt(17, 2));
+    }
+}
