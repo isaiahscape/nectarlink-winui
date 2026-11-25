@@ -265,7 +265,10 @@ jobs:
           }
 
           $setupName = "Nectarlink-$version-x64-setup.exe"
-          $setupPath = "dist\$setupName"
+          $setupPath = Join-Path $PWD "dist\$setupName"
+          $stageAbs = (Resolve-Path $bundleDir).Path
+          $iconAbs = (Resolve-Path 'winui\NectarLink.WinUI\Assets\nectarlink.ico').Path
+          $licenseAbs = (Resolve-Path "$bundleDir\LICENSE.txt").Path
           $makensis = @(
             (Get-Command makensis -ErrorAction SilentlyContinue).Source,
             (Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'),
@@ -278,9 +281,9 @@ jobs:
             "/DBUILD=$nsiBuild" `
             "/DDISPLAY_VERSION=$version" `
             "/DARCH=x64" `
-            "/DSTAGE=$bundleDir" `
-            "/DICON=winui\NectarLink.WinUI\Assets\nectarlink.ico" `
-            "/DLICENSE_FILE=$bundleDir\LICENSE.txt" `
+            "/DSTAGE=$stageAbs" `
+            "/DICON=$iconAbs" `
+            "/DLICENSE_FILE=$licenseAbs" `
             "/DOUTFILE=$setupPath" `
             'native\installer\nectarlink.nsi'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
