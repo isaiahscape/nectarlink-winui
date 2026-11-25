@@ -144,8 +144,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Read Rust toolchain channel
+        id: rust_toolchain
+        shell: pwsh
+        run: |
+          $raw = Get-Content -Raw rust-toolchain.toml
+          if ($raw -match '(?m)^channel\s*=\s*"([^"]+)"') {
+            "channel=$($Matches[1])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            throw "Could not parse channel from rust-toolchain.toml"
+          }
+
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
 
       - name: Cache Rust & Cargo build artifacts
         uses: Swatinem/rust-cache@v2
@@ -206,7 +219,6 @@ jobs:
             -p:Platform=x64 `
             -r win-x64 `
             --self-contained true `
-            --no-restore `
             -p:Version=${{ needs.resolve.outputs.assembly_version }} `
             -p:InformationalVersion=${{ needs.resolve.outputs.version }} `
             -o "dist/Nectarlink-${{ needs.resolve.outputs.version }}-win-x64"
