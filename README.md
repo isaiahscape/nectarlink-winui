@@ -4,36 +4,33 @@
 
 # NectarLink
 
-**Your Android phone and your PC, working as one.**
+**Your Android phone and your PC, working as one in a WinUI version.**
 
 Notifications, messages, calls, clipboard, files, photos, screen mirroring and
 phone apps in windows, between Android and Windows 10 (2004+), Windows 11 or Linux. Free and open source.
 Local-first, end-to-end encrypted, no account and no cloud.
 
-Hi, I'm Bee, and yes, a bee built an app called NectarLink. I build cool stuff
-in the open on [𝕏 @thtbee_](https://x.com/thtbee_), so come see what's next.
+A community-based Windows app for the original NectarLink project, with:
+- Enhanced user interface
+- Support for newer Windows features (glass effects, animations, etc.)
+
 Feedback, bugs or ideas? DM me directly, or come hang out in the
-[Hive on Discord](https://discord.gg/AA2Dp8PYqf).
+[Terrace on Discord](https://discord.gg/Y3mjXM9NvK).
 
-[![Latest release](https://img.shields.io/github/v/release/thtbee/nectarlink?label=download)](https://github.com/thtbee/nectarlink/releases/latest)
-[![CI](https://github.com/thtbee/nectarlink/actions/workflows/ci.yml/badge.svg)](https://github.com/thtbee/nectarlink/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/isaiahscape/nectarlink-winui?label=download)](https://github.com/isaiahscape/nectarlink-winui/releases/latest)
 [![Apps: GPL-3.0-or-later](https://img.shields.io/badge/apps-GPL--3.0--or--later-blue)](LICENSE)
-[![Core: MPL-2.0](https://img.shields.io/badge/core-MPL--2.0-blue)](LICENSE)
-[![Discord](https://img.shields.io/badge/Discord-the%20Hive-5865F2?logo=discord&logoColor=white)](https://discord.gg/AA2Dp8PYqf)
-
-<a href="https://buymeacoffee.com/thtbee_"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20some%20honey&emoji=%F0%9F%8D%AF&slug=thtbee_&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff&v=2" alt="Buy me some honey" height="40"></a>
 
 </div>
 
 <p align="center">
-  <img src="docs/screenshots/desktop-glass-home.png" alt="NectarLink for Windows: Home with the phone's notifications and music playing, Glass theme" width="880">
+  <img src="docs/screenshots/desktop-glass-home.png" alt="NectarLink for Windows: Home with the phone's notifications and music playing." width="880">
 </p>
 
 ## Why NectarLink
 
-NectarLink came out of my own frustration. I kept juggling Phone Link for
+NectarLink came out of the original dev'sfrustration. He kept juggling Phone Link for
 notifications and messages, KDE Connect for the clipboard and LocalSend for
-files, and always wanted one app that did all of it. So I made one.
+files, and always wanted one app that did all of it.
 
 It covers what those three did for me, with one app on each side, plus a lot
 of new features I wanted that I think you'll enjoy having too.
@@ -42,30 +39,12 @@ of new features I wanted that I think you'll enjoy having too.
 
 | | Download | Needs |
 |---|---|---|
-| **Windows (x64)** | [Installer (.exe)](https://github.com/thtbee/nectarlink/releases/download/v0.1.5/Nectarlink-0.1.5-x64-setup.exe) | Windows 10 (2004+) or 11, 64-bit Intel or AMD (Phone as webcam needs Windows 11) |
-| **Windows (ARM64)** | [Installer (.exe)](https://github.com/thtbee/nectarlink/releases/download/v0.1.5/Nectarlink-0.1.5-arm64-setup.exe) | Windows 11 on ARM (Snapdragon) |
-| **Linux (x86_64)** | [One command](#on-linux), or a [.deb](https://github.com/thtbee/nectarlink/releases/download/v0.1.5/nectarlink_0.1.5_amd64.deb), [.rpm](https://github.com/thtbee/nectarlink/releases/download/v0.1.5/nectarlink-0.1.5-1.x86_64.rpm), [AppImage](https://github.com/thtbee/nectarlink/releases/download/v0.1.5/Nectarlink-0.1.5-x86_64.AppImage) or [.tar.gz](https://github.com/thtbee/nectarlink/releases/download/v0.1.5/Nectarlink-0.1.5-linux-x86_64.tar.gz) | Ubuntu 24.04 or newer, Debian 13, Fedora 40 or newer, 64-bit Intel or AMD |
+| **Windows (x64)** | [Installer (.exe)](https://github.com/isaiahscape/nectarlink-winui/releases/latest) | Windows 10 (2004+) or 11, 64-bit Intel or AMD (Phone as webcam needs Windows 11) |
+| **Windows (ARM64)** | [Installer (.exe)](https://github.com/isaiahscape/nectarlink-winui/releases/latest) | Windows 11 on ARM (Snapdragon) |
 | **Android** | [App (.apk)](https://github.com/thtbee/nectarlink/releases/download/v0.1.5/Nectarlink-0.1.5-android.apk) | Android 8.0 or newer |
 
 The apps update themselves from GitHub Releases and check every download
 against its SHA-256 sums.
-
-### On Linux
-
-One command installs NectarLink with everything it needs, and shows each
-step as it goes:
-
-```bash
-curl -fsSL https://github.com/thtbee/nectarlink/releases/latest/download/install.sh | sh
-```
-
-It picks the package for your system (.deb with apt, .rpm with dnf or zypper,
-the tarball elsewhere), checks it against the release's SHA-256 sums and
-installs it with its dependencies. Then it sets up the phone as a webcam, the
-phone as a keyboard and mouse, and the firewall for your local network only.
-To remove it all again, end the same command with `sh -s -- --uninstall`
-instead of `sh`. See [Installing on Linux](docs/guide/getting-started.md#on-linux)
-for the details.
 
 > [!NOTE]
 > SmartScreen may warn about the Windows installer the first time, because it
@@ -157,7 +136,7 @@ in light and dark. In English, German, Turkish, Simplified Chinese, Brazilian Po
 
 ### Platform support
 
-| Feature | Windows | Linux | macOS (Preview) |
+| Feature | Windows |
 |---|---|---|---|
 | Pairing & mutual TLS | Yes | Yes | Yes |
 | Files & folder transfer | Yes | Yes | Yes |
@@ -194,21 +173,6 @@ Details: [Privacy and security](docs/guide/privacy-and-security.md) and the
 [security model](docs/technical/security-model.md).
 
 ## Screenshots
-
-**Hive** is an exclusive theme: honey, with a living honeycomb that breathes
-behind the app.
-
-| Hive, light | Hive, dark |
-|:---:|:---:|
-| <img src="docs/screenshots/desktop-hive-light.png" alt="Home in the Hive theme, light"> | <img src="docs/screenshots/desktop-hive-dark.png" alt="Home in the Hive theme, dark"> |
-
-Also **Bloom**, soft and colorful; **Glass**, translucent cards over the
-Windows backdrop; and **Graphite**, ink on paper. All in light and dark.
-
-| Bloom | Glass | Graphite |
-|:---:|:---:|:---:|
-| <img src="docs/screenshots/desktop-bloom-home.png" alt="Home with notifications and music playing on the PC, Bloom theme"> | <img src="docs/screenshots/desktop-glass-home.png" alt="Home with notifications and music playing on the PC, Glass theme"> | <img src="docs/screenshots/desktop-graphite-home.png" alt="Home with notifications and music playing on the PC, Graphite theme"> |
-| <img src="docs/screenshots/desktop-bloom-settings.png" alt="Settings, Bloom theme"> | <img src="docs/screenshots/desktop-glass-settings.png" alt="Settings, Glass theme"> | <img src="docs/screenshots/desktop-graphite-settings.png" alt="Settings, Graphite theme, dark"> |
 
 <p align="center">
   <img src="docs/screenshots/desktop-apps.png" alt="The Apps page with two phone apps open in their own windows" width="880"><br>
@@ -282,30 +246,12 @@ docs/                    Guide, technical docs, protocol, design system    (CC B
 | Part | Needs |
 |---|---|
 | Core and CLI | [Rust](https://rustup.rs) (stable, pinned in `rust-toolchain.toml`) |
-| Windows app | Windows 11, Visual Studio 2022 Build Tools (C++), [Qt 6.12](https://www.qt.io/download-open-source) for MSVC 2022 x64 |
-| Linux app | Ubuntu 24.04 or newer (glibc 2.39), a C++17 compiler, pkg-config, the X11, Wayland and D-Bus development packages, [Qt 6.12](https://www.qt.io/download-open-source) (`gcc_64`, with Qt Shader Tools and Qt Wayland Compositor) |
-| macOS app | macOS 14+, Xcode Command Line Tools, [Qt 6.12](https://www.qt.io/download-open-source) (or Homebrew Qt 6) |
-| Android app | Android SDK (platform 37, NDK 30.0.16248370), JDK 17 or newer, `cargo-ndk` (see [android/README.md](android/README.md)) |
-
-For Linux hardware video encoding and decoding, install `libavcodec-dev` and
-`libavutil-dev` before building. The backend loads the matching FFmpeg runtime
-libraries when needed and tries available GPU drivers. Release packages support
-FFmpeg 6 through 9: the Ubuntu 24.04 release build includes an FFmpeg 6 backend,
-and separate adapters support versions 7, 8 and 9. Source builds use the
-matching runtime for their headers. Without matching libraries or a working
-hardware backend, the existing software H.264 path remains available. HEVC
-encoding requires hardware; if unavailable, screen sharing falls back to H.264.
+| Windows app | Windows 11, Visual Studio 2022/2026 Build Tools (C++) |
 
 ```sh
 cargo test -p nectarlink-protocol -p nectarlink-core -p nectarlink-ffi   # core and tests
 cargo run -p nectarlink-cli -- --help                                     # command-line client
 cargo run -p nectarlink-desktop                                           # desktop app (Qt's bin on PATH)
-cd android && ./gradlew assembleDebug                                     # Android app
-```
-
-```powershell
-./scripts/package.ps1    # Windows installer: target\package\Nectarlink-<version>-x64-setup.exe
-./scripts/check.ps1      # every check CI runs; add -Android and -Arm64 for the full set
 ```
 
 Releases are built by CI from a `v*` tag; see
@@ -332,7 +278,7 @@ nix develop                       # enter development environment
 ## Questions and ideas
 
 Ask questions, share ideas and show your setup in
-[Discussions](https://github.com/thtbee/nectarlink/discussions). Issues are for
+[Discussions](https://github.com/isaiahscape/nectarlink-winui/discussions). Issues are for
 bugs and agreed feature work. For quick help and chat, there's the
 [Hive on Discord](https://discord.gg/AA2Dp8PYqf).
 
