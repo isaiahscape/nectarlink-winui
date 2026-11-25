@@ -455,7 +455,7 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\${DISPLAY}.lnk"
   Delete "$DESKTOP\${DISPLAY}.lnk"
 
-  ${GetFileName} "$INSTDIR" $0
+  ${un.GetFileName} "$INSTDIR" $0
   ${If} $0 == "${APP}"
     !insertmacro MoveAsideCameraFiles
     RMDir /r /REBOOTOK "$INSTDIR"

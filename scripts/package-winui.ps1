@@ -175,9 +175,13 @@ if ($StageOnly) { return }
 
 # ---- Installer ----
 Step "Installer ($Arch)"
-$makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
-if (-not $makensis) { $makensis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe' }
-if (-not (Test-Path $makensis)) {
+$makensis = @(
+    (Get-Command makensis -ErrorAction SilentlyContinue).Source,
+    (Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'),
+    (Join-Path $env:ProgramFiles 'NSIS\makensis.exe'),
+    'C:\ProgramData\chocolatey\bin\makensis.exe'
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if (-not $makensis) {
     throw "NSIS (makensis.exe) not found. Install NSIS or pass -StageOnly."
 }
 $iconPath = Join-Path $root 'winui\NectarLink.WinUI\Assets\nectarlink.ico'

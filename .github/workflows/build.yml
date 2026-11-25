@@ -224,6 +224,25 @@ jobs:
             -o "dist/Nectarlink-${{ needs.resolve.outputs.version }}-win-x64"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Ensure NSIS is installed
+        shell: pwsh
+        run: |
+          $candidates = @(
+            (Get-Command makensis -ErrorAction SilentlyContinue).Source,
+            (Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'),
+            (Join-Path $env:ProgramFiles 'NSIS\makensis.exe'),
+            'C:\ProgramData\chocolatey\bin\makensis.exe'
+          ) | Where-Object { $_ -and (Test-Path $_) }
+          if (-not $candidates) {
+            if (Get-Command choco -ErrorAction SilentlyContinue) {
+              choco install nsis -y --no-progress
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            } else {
+              winget install --id NSIS.NSIS -e --silent --accept-package-agreements --accept-source-agreements
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
+
       - name: Package installer, zip, metadata & SHA-256 checksums
         shell: pwsh
         run: |
@@ -247,9 +266,13 @@ jobs:
 
           $setupName = "Nectarlink-$version-x64-setup.exe"
           $setupPath = "dist\$setupName"
-          $makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
-          if (-not $makensis) { $makensis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe' }
-          if (-not (Test-Path $makensis)) { throw "NSIS (makensis) not found" }
+          $makensis = @(
+            (Get-Command makensis -ErrorAction SilentlyContinue).Source,
+            (Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'),
+            (Join-Path $env:ProgramFiles 'NSIS\makensis.exe'),
+            'C:\ProgramData\chocolatey\bin\makensis.exe'
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $makensis) { throw "NSIS (makensis) not found" }
           & $makensis /V2 `
             "/DVERSION=$numeric" `
             "/DBUILD=$nsiBuild" `
