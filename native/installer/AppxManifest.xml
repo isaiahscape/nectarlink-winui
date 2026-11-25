@@ -31,7 +31,7 @@
   <Applications>
     <Application
       Id="Nectarlink"
-      Executable="nectarlink-desktop.exe"
+      Executable="NectarLink.WinUI.exe"
       uap10:TrustLevel="mediumIL"
       uap10:RuntimeBehavior="win32App">
       <uap:VisualElements

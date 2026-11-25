@@ -58,6 +58,9 @@ public sealed partial class MainWindow : Window
         SetTitleBar(TitleBarGrid);
 
         var appWin = WindowChrome.GetAppWindow(this);
+        WindowChrome.ApplyAppIcon(this);
+        if (UiKit.LoadLocalImage("ms-appx:///Assets/brand/icon-512.png", 64) is { } titleLogo)
+            TitleBarLogo.Source = titleLogo;
         if (AppWindowTitleBar.IsCustomizationSupported())
         {
             appWin.TitleBar.PreferredHeightOption = TitleBarHeightOption.Tall;

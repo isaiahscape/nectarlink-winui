@@ -77,6 +77,7 @@ public sealed partial class MirrorWindow : Window
         Title = "NectarLink Mirror";
 
         var appWin = WindowChrome.GetAppWindow(this);
+        WindowChrome.ApplyAppIcon(this);
         appWin.Resize(new Windows.Graphics.SizeInt32(440, 880));
         appWin.Closing += (_, _) =>
         {

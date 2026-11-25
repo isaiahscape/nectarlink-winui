@@ -325,6 +325,13 @@ public static class UiKit
         try
         {
             string normalized = pathOrUrl.Trim();
+            if (normalized.StartsWith("ms-appx:///", StringComparison.OrdinalIgnoreCase))
+            {
+                string rel = normalized["ms-appx:///".Length..].Replace('/', '\\');
+                string localAsset = System.IO.Path.Combine(AppContext.BaseDirectory, rel);
+                if (System.IO.File.Exists(localAsset))
+                    normalized = localAsset;
+            }
             if (normalized.StartsWith("file:///", StringComparison.OrdinalIgnoreCase))
                 normalized = Uri.UnescapeDataString(normalized[8..]).Replace('/', '\\');
             bool isAppx = normalized.StartsWith("ms-appx:", StringComparison.OrdinalIgnoreCase);

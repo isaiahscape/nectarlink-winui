@@ -32,7 +32,7 @@
             </Grid.ColumnDefinitions>
 
             <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
-                <Image Source="ms-appx:///Assets/brand/icon-512.png" Width="18" Height="18" />
+                <Image x:Name="TitleBarLogo" Source="ms-appx:///Assets/brand/icon-512.png" Width="18" Height="18" />
                 <TextBlock
                     Text="NectarLink"
                     FontSize="12.5"

@@ -8,7 +8,9 @@
 //! - `notices <out>`: the third-party notices shipped with the Windows app.
 //! - `strings [--check]`: the Windows app's Rust-built text for Qt's
 //!   translation tools (`desktop/app/i18n/rust_strings.h`).
+//! - `icons`: renders the WinUI `.ico` and Sparse Package logo PNGs from `mark.rs`.
 
+mod icons;
 mod notices;
 mod strings;
 
@@ -33,9 +35,10 @@ fn main() -> ExitCode {
         ["notices", rest @ ..] => notices::run(rest),
         ["strings"] => strings::run(false),
         ["strings", "--check"] => strings::run(true),
+        ["icons"] => icons::run(),
         _ => {
             eprintln!(
-                "usage: cargo xtask tokens [--check] | strings [--check] | notices <out> [--target <triple>]"
+                "usage: cargo xtask tokens [--check] | strings [--check] | icons | notices <out> [--target <triple>]"
             );
             return ExitCode::from(2);
         }

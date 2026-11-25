@@ -89,6 +89,20 @@ public static class WindowChrome
         return AppWindow.GetFromWindowId(windowId);
     }
 
+    public static void ApplyAppIcon(Window window)
+    {
+        try
+        {
+            string icoPath = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "nectarlink.ico");
+            if (System.IO.File.Exists(icoPath))
+                GetAppWindow(window).SetIcon(icoPath);
+        }
+        catch
+        {
+            // Keep default EXE icon resource if AppWindow.SetIcon is unsupported in this session.
+        }
+    }
+
     public static void SetDarkTitleBar(Window window, bool dark)
     {
         var hwnd = GetHwnd(window);

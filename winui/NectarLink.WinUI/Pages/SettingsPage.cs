@@ -938,7 +938,14 @@ public sealed partial class SettingsPage : Page, IRefreshablePage
     private void RenderConnectionAndAbout(JsonObject prefs)
     {
         var engine = NectarLinkEngine.Current;
-        _detailStack.Children.Add(UiKit.Card(UiKit.BodyText($"NectarLink WinUI 3 · Version {engine.App["version"]?.GetValue<string>() ?? "0.1.5"}")));
+        var aboutRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 14, VerticalAlignment = VerticalAlignment.Center };
+        if (UiKit.LoadLocalImage("ms-appx:///Assets/brand/icon-512.png", 96) is { } aboutLogo)
+            aboutRow.Children.Add(new Image { Source = aboutLogo, Width = 44, Height = 44 });
+        var aboutText = new StackPanel { Spacing = 2, VerticalAlignment = VerticalAlignment.Center };
+        aboutText.Children.Add(UiKit.BodyText($"NectarLink WinUI 3 · Version {engine.App["version"]?.GetValue<string>() ?? "0.1.5"}"));
+        aboutText.Children.Add(UiKit.MutedText(Loc.Tr("Settings", "Local-first, end-to-end encrypted phone link for Windows")));
+        aboutRow.Children.Add(aboutText);
+        _detailStack.Children.Add(UiKit.Card(aboutRow));
 
         _detailStack.Children.Add(ToggleRow("Stay connected over mobile data relay when away from home", prefs["awayMode"]?.GetValue<bool>() ?? false, v => SetPref("awayMode", v)));
         _detailStack.Children.Add(ToggleRow("Check for updates automatically", prefs["autoUpdate"]?.GetValue<bool>() ?? true, v => SetPref("autoUpdate", v)));

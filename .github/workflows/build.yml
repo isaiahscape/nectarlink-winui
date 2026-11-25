@@ -172,7 +172,7 @@ jobs:
             nuget-${{ runner.os }}-x64-
 
       - name: Build native Rust DLLs (Release)
-        run: cargo build --locked --release -p nectarlink-winui-core -p nectarlink-vcam -p nectarlink-credprov
+        run: cargo build --locked --release -p nectarlink-winui-core -p nectarlink-vcam -p nectarlink-credprov -p nectarlink-mcp
 
       - name: Restore .NET & WinUI solution
         run: dotnet restore winui/NectarLink.WinUI.sln -p:Platform=x64
@@ -212,29 +212,64 @@ jobs:
             -o "dist/Nectarlink-${{ needs.resolve.outputs.version }}-win-x64"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Package zip, metadata & SHA-256 checksums
+      - name: Package installer, zip, metadata & SHA-256 checksums
         shell: pwsh
         run: |
           $version = '${{ needs.resolve.outputs.version }}'
           $channel = '${{ needs.resolve.outputs.channel }}'
+          $numeric = ($version -split '[-+]')[0]
+          $nsiBuild = if ($channel -eq 'stable' -and '${{ github.ref_type }}' -eq 'tag' -and $version -notmatch '-') { 999 } else { [Math]::Min([int]$env:GITHUB_RUN_NUMBER, 65534) }
           $bundleDir = "dist\Nectarlink-$version-win-x64"
+          if (Test-Path 'target\release\nectarlink-agent.exe') {
+            Copy-Item -Force 'target\release\nectarlink-agent.exe' "$bundleDir\nectarlink-agent.exe"
+          }
           Copy-Item -Force 'LICENSE' "$bundleDir\LICENSE.txt"
           Copy-Item -Force 'CHANGELOG.md' "$bundleDir\CHANGELOG.md"
+
+          $manifestPath = "$bundleDir\AppxManifest.xml"
+          if (Test-Path $manifestPath) {
+            $manifest = Get-Content $manifestPath -Raw
+            $manifest = $manifest -replace '(<Identity\b[^>]*?\s)Version="[^"]*"', "`${1}Version=`"$numeric.$nsiBuild`""
+            Set-Content -Path $manifestPath -Value $manifest -Encoding UTF8 -NoNewline
+          }
+
+          $setupName = "Nectarlink-$version-x64-setup.exe"
+          $setupPath = "dist\$setupName"
+          $makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+          if (-not $makensis) { $makensis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe' }
+          if (-not (Test-Path $makensis)) { throw "NSIS (makensis) not found" }
+          & $makensis /V2 `
+            "/DVERSION=$numeric" `
+            "/DBUILD=$nsiBuild" `
+            "/DDISPLAY_VERSION=$version" `
+            "/DARCH=x64" `
+            "/DSTAGE=$bundleDir" `
+            "/DICON=winui\NectarLink.WinUI\Assets\nectarlink.ico" `
+            "/DLICENSE_FILE=$bundleDir\LICENSE.txt" `
+            "/DOUTFILE=$setupPath" `
+            'native\installer\nectarlink.nsi'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $zipName = "Nectarlink-$version-win-x64.zip"
           $zipPath = "dist\$zipName"
           Compress-Archive -Path "$bundleDir\*" -DestinationPath $zipPath -CompressionLevel Optimal -Force
 
-          $hash = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash.ToLowerInvariant()
-          "$hash  $zipName" | Out-File -FilePath 'dist\SHA256SUMS.txt' -Encoding ascii
+          $setupHash = (Get-FileHash -Algorithm SHA256 -Path $setupPath).Hash.ToLowerInvariant()
+          $zipHash = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash.ToLowerInvariant()
+          @(
+            "$setupHash  $setupName",
+            "$zipHash  $zipName"
+          ) | Out-File -FilePath 'dist\SHA256SUMS.txt' -Encoding ascii
 
           @{
             channel = $channel
             version = $version
             commit = $env:GITHUB_SHA
             built_at = (Get-Date).ToUniversalTime().ToString('o')
+            installer = $setupName
+            installer_sha256 = $setupHash
             asset = $zipName
-            sha256 = $hash
+            sha256 = $zipHash
           } | ConvertTo-Json -Depth 3 | Out-File -FilePath 'dist\channel-manifest.json' -Encoding utf8
 
       - name: Upload workflow build artifacts
@@ -242,6 +277,7 @@ jobs:
         with:
           name: nectarlink-${{ needs.resolve.outputs.channel }}-${{ needs.resolve.outputs.version }}-win-x64
           path: |
+            dist/Nectarlink-*-setup.exe
             dist/Nectarlink-*.zip
             dist/SHA256SUMS.txt
             dist/channel-manifest.json
@@ -259,6 +295,7 @@ jobs:
           $title = "NectarLink $version ($channel pre-release)"
           $notes = "Automated **$channel** pre-release build from ``$env:GITHUB_SHA``.`n`nVerify downloads against ``SHA256SUMS.txt``."
           $assets = @(
+            "dist\Nectarlink-$version-x64-setup.exe",
             "dist\Nectarlink-$version-win-x64.zip",
             "dist\SHA256SUMS.txt",
             "dist\channel-manifest.json"
@@ -284,6 +321,7 @@ jobs:
           $title = "NectarLink $version ($channel)"
           $notes = "Official **$channel** release build from ``$env:GITHUB_SHA``.`n`nVerify downloads against ``SHA256SUMS.txt``."
           $assets = @(
+            "dist\Nectarlink-$version-x64-setup.exe",
             "dist\Nectarlink-$version-win-x64.zip",
             "dist\SHA256SUMS.txt",
             "dist\channel-manifest.json"

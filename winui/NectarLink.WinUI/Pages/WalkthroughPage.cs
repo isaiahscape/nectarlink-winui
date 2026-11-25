@@ -119,6 +119,16 @@ public sealed partial class WalkthroughPage : Page, IRefreshablePage
         switch (_step)
         {
             case 0:
+                if (UiKit.LoadLocalImage("ms-appx:///Assets/brand/icon-512.png", 144) is { } welcomeLogo)
+                {
+                    _body.Children.Add(new Image
+                    {
+                        Source = welcomeLogo,
+                        Width = 72,
+                        Height = 72,
+                        HorizontalAlignment = HorizontalAlignment.Left
+                    });
+                }
                 _body.Children.Add(UiKit.TitleText(Loc.Tr("Walkthrough", "Welcome to NectarLink"), 28));
                 _body.Children.Add(UiKit.BodyText(Loc.Tr(
                     "Walkthrough",
